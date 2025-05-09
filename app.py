@@ -248,4 +248,5 @@ def handle_past_data(save_click, view_click, delete_click, sentiment, start_date
     return html.Pre(past_data.to_string())
 
 if __name__ == "__main__":
-    app.run_server(debug=True, host="0.0.0.0", port=10000)
+    app.run(debug=False, host="0.0.0.0", port=10000)
+
