@@ -3,4 +3,3 @@ dash-bootstrap-components
 pandas
 openpyxl
 plotly
-sqlite3  # optional, built-in
