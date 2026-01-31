@@ -54,7 +54,7 @@ app.layout = dbc.Container([
     
     dbc.Row([
         dbc.Col(html.H1("Call Center Sentiment Analysis Dashboard", className="text-primary"), md=9),
-        dbc.Col(html.H5("Done by: Harsha Kyle", className="text-end fw-bold text-secondary"), md=3)
+        dbc.Col(html.H5("Done by: Harsha Kyle and Mann", className="text-end fw-bold text-secondary"), md=3)
     ], className="mb-4"),
     # Filters Section
     dbc.Row([
