@@ -1,6 +1,6 @@
-dash
-dash-bootstrap-components
+dash==3.3.0
+dash-bootstrap-components==2.0.4
 pandas
 openpyxl
-plotly
+plotly==6.3.0
 gunicorn
