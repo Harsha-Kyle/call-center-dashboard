@@ -369,7 +369,6 @@ def style_fig(fig, height=300):
         height=height,
         margin=dict(l=18, r=18, t=22, b=25),
         hoverlabel=dict(bgcolor="white", font_size=12),
-        dragmode=False,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -880,7 +879,21 @@ body {
 
 .filter-count { font-size: 11px; color: var(--muted); padding-top: 8px; }
 
-.chart-card .card-body { padding: 17px 17px 8px; }
+.chart-card {
+    min-width: 0;
+    overflow: hidden;
+}
+
+.chart-card .card-body {
+    padding: 17px 17px 8px;
+    min-width: 0;
+}
+
+.chart-card .dash-graph {
+    width: 100%;
+    min-width: 0;
+    min-height: 320px;
+}
 .chart-title { font-size: 12px; font-weight: 750; margin: 0; }
 .chart-subtitle { font-size: 10px; color: var(--muted); margin-top: 5px; }
 
