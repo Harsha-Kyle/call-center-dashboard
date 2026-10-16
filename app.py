@@ -369,6 +369,7 @@ def style_fig(fig, height=300):
         height=height,
         margin=dict(l=18, r=18, t=22, b=25),
         hoverlabel=dict(bgcolor="white", font_size=12),
+        dragmode=False,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -411,6 +412,7 @@ def kpi_card(label, value_id, note_id, icon, accent):
     )
 
 
+
 def chart_card(title, subtitle, graph_id):
     return dbc.Card(
         dbc.CardBody(
@@ -419,7 +421,12 @@ def chart_card(title, subtitle, graph_id):
                 html.Div(subtitle, className="chart-subtitle"),
                 dcc.Graph(
                     id=graph_id,
-                    config={"displayModeBar": False, "responsive": True},
+                    config={
+                        "displayModeBar": False,
+                        "responsive": True,
+                        "scrollZoom": False,
+                        "staticPlot": True,
+                    },
                     style={"width": "100%"},
                 ),
             ]
@@ -573,29 +580,62 @@ def resolution_figure(df):
     return style_fig(fig)
 
 
+
 def rating_figure(df):
     if df.empty:
         return empty_figure()
 
     grouped = (
-        df["Satisfaction rating"].round().value_counts().sort_index()
-        .rename_axis("Rating").reset_index(name="Calls")
+        df["Satisfaction rating"]
+        .round()
+        .value_counts()
+        .sort_index()
+        .rename_axis("Rating")
+        .reset_index(name="Calls")
     )
+
+    # Use discrete colors rather than mapping a numeric Rating
+    # column to a continuous color scale.
+    rating_colors = {
+        1: "#C95454",
+        2: "#D97757",
+        3: "#C78326",
+        4: "#72A66A",
+        5: "#258765",
+    }
+
+    grouped["RatingLabel"] = grouped["Rating"].astype(str)
+    grouped["BarColor"] = grouped["Rating"].map(
+        lambda rating: rating_colors.get(int(rating), "#3569C8")
+    )
+
     fig = px.bar(
         grouped,
-        x="Rating",
+        x="RatingLabel",
         y="Calls",
         text="Calls",
-        color="Rating",
-        color_continuous_scale=["#C95454", "#C78326", "#258765"],
+        custom_data=["Rating"],
     )
-    fig.update_traces(textposition="outside")
+
+    fig.update_traces(
+        marker_color=grouped["BarColor"].tolist(),
+        textposition="outside",
+        hovertemplate="Rating: %{customdata[0]}<br>Calls: %{y}<extra></extra>",
+    )
+
     fig.update_layout(
-        coloraxis_showscale=False,
+        showlegend=False,
         xaxis_title="Satisfaction rating",
         yaxis_title="Calls",
-        xaxis=dict(dtick=1),
+        xaxis=dict(
+            type="category",
+            categoryorder="array",
+            categoryarray=["1", "2", "3", "4", "5"],
+        ),
+        yaxis=dict(rangemode="tozero"),
+        margin=dict(l=18, r=18, t=30, b=25),
     )
+
     return style_fig(fig)
 
 
