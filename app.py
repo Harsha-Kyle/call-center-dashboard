@@ -1,24 +1,29 @@
-# Call Center Sentiment Analytics — Stable Dashboard
+# ============================================================
+# CALL CENTER INTELLIGENCE
+# ============================================================
 
 import os
+import re
+import json
 import sqlite3
-from contextlib import closing
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+
 import dash
 from dash import (
     dcc,
     html,
+    dash_table,
     Input,
     Output,
     State,
-    ctx,
-    dash_table,
     ALL,
+    ctx,
     no_update,
 )
 import dash_bootstrap_components as dbc
@@ -29,21 +34,22 @@ import dash_bootstrap_components as dbc
 # ============================================================
 
 APP_TITLE = "Call Center Intelligence"
-BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = Path(os.getenv("DATA_FILE", str(BASE_DIR / "CallCenterDataset.xlsx")))
+
+try:
+    BASE_DIR = Path(__file__).resolve().parent
+except NameError:
+    BASE_DIR = Path.cwd()
+
+DATA_FILE = Path(
+    os.getenv("DATA_FILE", str(BASE_DIR / "CallCenterDataset.xlsx"))
+)
 SHEET_NAME = os.getenv("SHEET_NAME", "Sheet1")
-DB_PATH = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "call_center_data.db")))
+DATABASE_FILE = Path(
+    os.getenv("DATABASE_FILE", str(BASE_DIR / "call_center_dashboard.db"))
+)
+
 PORT = int(os.getenv("PORT", "8050"))
-
-NAVY = "#17233f"
-BLUE = "#4f6bed"
-MUTED = "#758198"
-
-COLORS = {
-    "Positive": "#16a34a",
-    "Neutral": "#f59e0b",
-    "Negative": "#ef4444",
-}
+DEBUG = os.getenv("DASH_DEBUG", "false").lower() == "true"
 
 REQUIRED_COLUMNS = {
     "Satisfaction rating",
@@ -52,895 +58,1456 @@ REQUIRED_COLUMNS = {
     "AvgTalkDuration",
 }
 
+C = {
+    "nav": "#202A3B",
+    "nav_text": "#C7D0DD",
+    "page": "#F4F6F9",
+    "card": "#FFFFFF",
+    "text": "#202B3C",
+    "muted": "#748094",
+    "border": "#E3E8EF",
+    "blue": "#3569C8",
+    "green": "#258765",
+    "orange": "#C78326",
+    "red": "#C95454",
+    "purple": "#7865B7",
+}
+
+SENTIMENT_COLORS = {
+    "Positive": C["green"],
+    "Neutral": C["orange"],
+    "Negative": C["red"],
+}
+
+_DB_LOCK = threading.Lock()
+DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 
 # ============================================================
-# DATA PROCESSING
+# DATABASE
 # ============================================================
 
-def classify_sentiment(value):
-    rating = pd.to_numeric(value, errors="coerce")
+def db_connection():
+    connection = sqlite3.connect(str(DATABASE_FILE), timeout=20)
+    connection.row_factory = sqlite3.Row
+    return connection
 
-    if pd.isna(rating):
+
+def init_database():
+    with _DB_LOCK:
+        with db_connection() as con:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS saved_views (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    filters_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            con.commit()
+
+
+init_database()
+
+
+def get_saved_views():
+    with _DB_LOCK:
+        with db_connection() as con:
+            rows = con.execute(
+                """
+                SELECT id, name, filters_json, created_at
+                FROM saved_views
+                ORDER BY id DESC
+                """
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def make_saved_view_options(views):
+    return [
+        {
+            "label": f"{row['name']}  ·  {row['created_at']}",
+            "value": row["id"],
+        }
+        for row in views
+    ]
+
+
+# ============================================================
+# DATA CLEANING
+# ============================================================
+
+def parse_duration(value):
+    if pd.isna(value):
         return None
 
-    if rating >= 4:
-        return "Positive"
-    if rating == 3:
-        return "Neutral"
-    return "Negative"
+    if isinstance(value, pd.Timedelta):
+        return max(value.total_seconds(), 0)
+
+    if hasattr(value, "total_seconds") and not isinstance(value, str):
+        try:
+            return max(float(value.total_seconds()), 0)
+        except Exception:
+            pass
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number < 0:
+            return None
+        # Excel time values are often fractions of one day.
+        if 0 < number < 1:
+            return number * 86400
+        return number
+
+    value = str(value).strip()
+
+    if not value or value.lower() in {"nan", "none", "nat"}:
+        return None
+
+    try:
+        number = float(value)
+        if number < 0:
+            return None
+        if 0 < number < 1:
+            return number * 86400
+        return number
+    except ValueError:
+        pass
+
+    if re.fullmatch(r"\d{1,3}:\d{1,2}(:\d{1,2})?", value):
+        parts = [int(x) for x in value.split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return parts[0] * 60 + parts[1]
+
+    text = value.lower()
+    h = re.search(r"(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b", text)
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b", text)
+    s = re.search(r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b", text)
+
+    if h or m or s:
+        total = 0
+        if h:
+            total += float(h.group(1)) * 3600
+        if m:
+            total += float(m.group(1)) * 60
+        if s:
+            total += float(s.group(1))
+        return total
+
+    try:
+        return max(pd.to_timedelta(value).total_seconds(), 0)
+    except Exception:
+        return None
 
 
-def parse_duration(series):
-    """Convert numeric durations or time strings into seconds."""
-    original = series.copy()
-    result = pd.to_numeric(original, errors="coerce")
+def normalise_resolution(value):
+    if pd.isna(value):
+        return "Unknown"
 
-    # Excel stores time-only durations as fractions of a day.
-    excel_fraction = result.between(0, 1, inclusive="neither")
-    result.loc[excel_fraction] *= 86400
+    if isinstance(value, bool):
+        return "Resolved" if value else "Unresolved"
 
-    missing = result.isna()
+    text = str(value).strip().lower()
 
-    if missing.any():
-        values = original.loc[missing].astype(str).str.strip()
+    if text in {
+        "1", "true", "yes", "y", "resolved", "complete",
+        "completed", "closed", "success", "successful",
+    }:
+        return "Resolved"
 
-        # Try parsing standard durations such as 00:02:30.
-        parsed = pd.to_timedelta(values, errors="coerce")
-        result.loc[missing] = parsed.dt.total_seconds()
+    if text in {
+        "0", "false", "no", "n", "unresolved", "not resolved",
+        "open", "pending", "incomplete", "failed",
+    }:
+        return "Unresolved"
 
-        # Fallback for MM:SS strings.
-        remaining = result.loc[missing].isna()
-
-        for index, value in values.loc[remaining].items():
-            parts = value.split(":")
-            try:
-                if len(parts) == 2:
-                    result.loc[index] = float(parts[0]) * 60 + float(parts[1])
-                elif len(parts) == 3:
-                    result.loc[index] = (
-                        float(parts[0]) * 3600
-                        + float(parts[1]) * 60
-                        + float(parts[2])
-                    )
-            except (ValueError, TypeError):
-                continue
-
-    return result
+    return str(value).strip().title() or "Unknown"
 
 
-def normalize_resolution(series):
-    mapping = {
-        "Y": "Y",
-        "YES": "Y",
-        "TRUE": "Y",
-        "1": "Y",
-        "RESOLVED": "Y",
-        "COMPLETED": "Y",
-        "N": "N",
-        "NO": "N",
-        "FALSE": "N",
-        "0": "N",
-        "UNRESOLVED": "N",
-        "PENDING": "N",
-    }
+def format_duration(seconds):
+    if seconds is None or pd.isna(seconds):
+        return "N/A"
 
-    return (
-        series.astype("string")
-        .str.strip()
-        .str.upper()
-        .map(mapping)
-    )
+    seconds = max(int(round(float(seconds))), 0)
+    hours, remaining = divmod(seconds, 3600)
+    minutes, seconds = divmod(remaining, 60)
+
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def load_data():
     if not DATA_FILE.exists():
         raise FileNotFoundError(
-            f"Dataset not found:\n{DATA_FILE.resolve()}\n\n"
+            f"Dataset not found: {DATA_FILE}\n"
             "Place CallCenterDataset.xlsx beside app.py, "
             "or set the DATA_FILE environment variable."
         )
 
-    try:
-        data = pd.read_excel(DATA_FILE, sheet_name=SHEET_NAME)
-    except ValueError as exc:
-        raise ValueError(
-            f"Sheet '{SHEET_NAME}' was not found in {DATA_FILE.name}. "
-            "Update SHEET_NAME to match your workbook."
-        ) from exc
+    df = pd.read_excel(DATA_FILE, sheet_name=SHEET_NAME)
+    df.columns = [str(col).strip() for col in df.columns]
 
-    data.columns = [str(column).strip() for column in data.columns]
-
-    missing = REQUIRED_COLUMNS - set(data.columns)
+    missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(
-            "Missing required columns: " + ", ".join(sorted(missing))
+            "Missing required Excel columns: "
+            + ", ".join(sorted(missing))
+            + "\nFound columns: "
+            + ", ".join(df.columns)
         )
 
-    data = data.copy()
-
-    data["Satisfaction rating"] = pd.to_numeric(
-        data["Satisfaction rating"], errors="coerce"
+    df = df.copy()
+    df["Satisfaction rating"] = pd.to_numeric(
+        df["Satisfaction rating"], errors="coerce"
     )
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Date"] = df["Date"].dt.tz_localize(None)
+    df["DurationSeconds"] = df["AvgTalkDuration"].apply(parse_duration)
+    df["ResolvedStatus"] = df["Resolved"].apply(normalise_resolution)
 
-    # Parse dates without forcing timezone conversion.
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    df = df.dropna(
+        subset=["Satisfaction rating", "Date", "DurationSeconds"]
+    ).copy()
+    df = df[df["DurationSeconds"] >= 0].copy()
 
-    try:
-        if data["Date"].dt.tz is not None:
-            data["Date"] = data["Date"].dt.tz_localize(None)
-    except (AttributeError, TypeError):
-        pass
-
-    data["AvgTalkDuration"] = parse_duration(data["AvgTalkDuration"])
-    data["Resolved"] = normalize_resolution(data["Resolved"])
-    data["Sentiment"] = data["Satisfaction rating"].apply(classify_sentiment)
-
-    data = data.dropna(
-        subset=[
-            "Date",
-            "Satisfaction rating",
-            "AvgTalkDuration",
-            "Resolved",
-            "Sentiment",
-        ]
-    )
-
-    data = data[data["AvgTalkDuration"] >= 0].copy()
-
-    if data.empty:
+    if df.empty:
         raise ValueError(
-            "No valid rows remain after cleaning. Check the date, "
-            "satisfaction, resolution and duration columns."
+            "No valid rows remain after cleaning. Check your Date, "
+            "Satisfaction rating, and AvgTalkDuration columns."
         )
 
-    data["Resolution"] = data["Resolved"].map({
-        "Y": "Resolved",
-        "N": "Unresolved",
-    })
+    df["Sentiment"] = df["Satisfaction rating"].apply(
+        lambda rating: (
+            "Positive" if rating >= 4
+            else "Neutral" if rating >= 3
+            else "Negative"
+        )
+    )
+    df["DateOnly"] = df["Date"].dt.date
+    df["CallDate"] = df["Date"].dt.strftime("%Y-%m-%d")
+    df["Month"] = df["Date"].dt.to_period("M").astype(str)
+    df["DurationMinutes"] = df["DurationSeconds"] / 60
+    df["DurationLabel"] = df["DurationSeconds"].apply(format_duration)
+    df = df.sort_values("Date", ascending=False).reset_index(drop=True)
+    df["CallID"] = [f"CALL-{i + 1:05d}" for i in range(len(df))]
 
-    data.reset_index(drop=True, inplace=True)
-    return data
-
-
-df = load_data()
-
-MIN_DATE = df["Date"].min().date()
-MAX_DATE = df["Date"].max().date()
-MIN_DURATION = float(df["AvgTalkDuration"].min())
-MAX_DURATION = float(df["AvgTalkDuration"].max())
-
-SLIDER_MIN = min(0.0, MIN_DURATION)
-SLIDER_MAX = max(MAX_DURATION, SLIDER_MIN + 1.0)
-
-SLIDER_STEP = max((SLIDER_MAX - SLIDER_MIN) / 500, 0.1)
-
-DEFAULT_DURATION = [MIN_DURATION, MAX_DURATION]
+    return df
 
 
-# ============================================================
-# SQLITE DATABASE AND MIGRATIONS
-# ============================================================
+DF = load_data()
 
-def connect_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(DB_PATH), timeout=15)
-    connection.row_factory = sqlite3.Row
-    return connection
+MIN_DATE = DF["DateOnly"].min()
+MAX_DATE = DF["DateOnly"].max()
+MIN_DURATION = float(DF["DurationSeconds"].min())
+MAX_DURATION = float(DF["DurationSeconds"].max())
 
+SLIDER_MIN = min(MIN_DURATION, 0)
+SLIDER_MAX = max(MAX_DURATION, SLIDER_MIN + 1)
 
-def init_db():
-    with closing(connect_db()) as connection:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS past_filters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL DEFAULT 'Saved view',
-                sentiment TEXT NOT NULL DEFAULT '',
-                start_date TEXT NOT NULL DEFAULT '',
-                end_date TEXT NOT NULL DEFAULT '',
-                resolved TEXT NOT NULL DEFAULT '',
-                duration_min REAL,
-                duration_max REAL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+if SLIDER_MIN == SLIDER_MAX:
+    SLIDER_MAX = SLIDER_MIN + 1
 
-        columns = {
-            row["name"]
-            for row in connection.execute(
-                "PRAGMA table_info(past_filters)"
-            ).fetchall()
-        }
-
-        migrations = {
-            "name": "TEXT NOT NULL DEFAULT 'Saved view'",
-            "sentiment": "TEXT NOT NULL DEFAULT ''",
-            "start_date": "TEXT NOT NULL DEFAULT ''",
-            "end_date": "TEXT NOT NULL DEFAULT ''",
-            "resolved": "TEXT NOT NULL DEFAULT ''",
-            "duration_min": "REAL",
-            "duration_max": "REAL",
-            "created_at": "TEXT NOT NULL DEFAULT ''",
-        }
-
-        for column, definition in migrations.items():
-            if column not in columns:
-                connection.execute(
-                    f"ALTER TABLE past_filters ADD COLUMN {column} {definition}"
-                )
-
-        connection.commit()
-
-
-init_db()
+DEFAULT_DURATION = [SLIDER_MIN, SLIDER_MAX]
 
 
 # ============================================================
-# SHARED HELPERS
+# FILTERS AND CHART HELPERS
 # ============================================================
 
-def seconds_label(value):
-    if pd.isna(value):
-        return "—"
-
-    value = max(0.0, float(value))
-
-    if value >= 3600:
-        return f"{int(value // 3600)}h {int((value % 3600) // 60)}m"
-
-    if value >= 60:
-        return f"{int(value // 60)}m {int(value % 60)}s"
-
-    if value.is_integer():
-        return f"{int(value)}s"
-
-    return f"{value:.1f}s"
-
-
-def filter_data(sentiments, start_date, end_date, resolved, duration):
-    data = df
-
-    if sentiments:
-        data = data[data["Sentiment"].isin(sentiments)]
+def filtered_data(start_date, end_date, sentiment, resolution, duration_range):
+    df = DF.copy()
 
     if start_date:
-        data = data[data["Date"] >= pd.Timestamp(start_date)]
-
+        df = df[df["DateOnly"] >= pd.to_datetime(start_date).date()]
     if end_date:
-        data = data[
-            data["Date"] < pd.Timestamp(end_date) + pd.Timedelta(days=1)
-        ]
+        df = df[df["DateOnly"] <= pd.to_datetime(end_date).date()]
+    if sentiment and sentiment != "All":
+        df = df[df["Sentiment"] == sentiment]
+    if resolution and resolution != "All":
+        df = df[df["ResolvedStatus"] == resolution]
 
-    if resolved in ("Y", "N"):
-        data = data[data["Resolved"] == resolved]
+    if duration_range and len(duration_range) == 2:
+        low, high = sorted(map(float, duration_range))
+        df = df[df["DurationSeconds"].between(low, high, inclusive="both")]
 
-    if duration and len(duration) == 2:
-        low, high = sorted([float(duration[0]), float(duration[1])])
-        data = data[data["AvgTalkDuration"].between(low, high)]
-
-    return data.copy()
+    return df
 
 
-def empty_figure(message="No records match these filters."):
-    figure = go.Figure()
-
-    figure.add_annotation(
+def empty_figure(message="No data matches these filters"):
+    fig = go.Figure()
+    fig.add_annotation(
         text=message,
-        x=0.5,
-        y=0.5,
-        xref="paper",
-        yref="paper",
+        x=0.5, y=0.5,
+        xref="paper", yref="paper",
         showarrow=False,
-        font={"size": 14, "color": MUTED},
+        font={"size": 13, "color": C["muted"]},
     )
-
-    figure.update_layout(
+    fig.update_layout(
         template="plotly_white",
-        height=310,
-        margin=dict(l=15, r=15, t=20, b=20),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        height=300,
+        margin=dict(l=20, r=20, t=15, b=15),
         xaxis={"visible": False},
         yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
     )
+    return fig
 
-    return figure
 
-
-def style_figure(figure):
-    figure.update_layout(
+def style_fig(fig, height=300):
+    fig.update_layout(
         template="plotly_white",
-        height=310,
-        margin=dict(l=25, r=15, t=20, b=35),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font={
-            "family": "Inter, Segoe UI, sans-serif",
-            "color": NAVY,
-            "size": 12,
-        },
-        legend_title_text="",
-        hoverlabel={"bgcolor": NAVY, "font_color": "white"},
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(family="Arial, sans-serif", size=12, color=C["text"]),
+        height=height,
+        margin=dict(l=18, r=18, t=22, b=25),
+        hoverlabel=dict(bgcolor="white", font_size=12),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=10),
+        ),
     )
-
-    figure.update_xaxes(
-        showgrid=False,
-        zeroline=False,
-        linecolor="#e9edf5",
-    )
-
-    figure.update_yaxes(
-        gridcolor="#edf1f7",
-        zeroline=False,
-    )
-
-    return figure
+    fig.update_xaxes(showgrid=False, linecolor=C["border"])
+    fig.update_yaxes(gridcolor="#EDF0F5", zeroline=False)
+    return fig
 
 
-def metric_card(title, value_id, note_id, icon_name, color):
+def kpi_card(label, value_id, note_id, icon, accent):
     return dbc.Card(
-        dbc.CardBody([
-            html.Div([
-                html.Div(title, className="metric-label"),
+        dbc.CardBody(
+            [
                 html.Div(
-                    html.I(className=f"bi {icon_name}"),
-                    className="metric-icon",
-                    style={
-                        "color": color,
-                        "backgroundColor": f"{color}15",
-                    },
+                    [
+                        html.Div(
+                            html.I(className=f"bi {icon}"),
+                            className="kpi-icon",
+                            style={"color": accent, "background": f"{accent}16"},
+                        ),
+                        html.Div(
+                            [
+                                html.Div(label, className="kpi-label"),
+                                html.Div(id=value_id, className="kpi-value"),
+                            ],
+                            className="flex-grow-1",
+                        ),
+                    ],
+                    className="d-flex align-items-center gap-3",
                 ),
-            ], className="d-flex justify-content-between align-items-center"),
-            html.Div(id=value_id, className="metric-value"),
-            html.Div(id=note_id, className="metric-note"),
-        ]),
-        className="metric-card h-100",
+                html.Div(id=note_id, className="kpi-note"),
+            ]
+        ),
+        className="dashboard-card kpi-card h-100",
     )
 
 
 def chart_card(title, subtitle, graph_id):
     return dbc.Card(
-        dbc.CardBody([
-            html.H5(title, className="chart-title"),
-            html.P(subtitle, className="chart-subtitle"),
-            dcc.Graph(
-                id=graph_id,
-                figure=empty_figure(),
-                config={
-                    "displaylogo": False,
-                    "responsive": True,
-                    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-                },
-                style={"height": "330px"},
-            ),
-        ]),
-        className="panel-card h-100",
+        dbc.CardBody(
+            [
+                html.H6(title, className="chart-title"),
+                html.Div(subtitle, className="chart-subtitle"),
+                dcc.Graph(
+                    id=graph_id,
+                    config={"displayModeBar": False, "responsive": True},
+                    style={"width": "100%"},
+                ),
+            ]
+        ),
+        className="dashboard-card chart-card h-100",
     )
 
 
-def make_insights(data):
-    if data.empty:
-        return dbc.Alert(
-            "No insights available for the current filters.",
-            color="light",
-        )
+def insights_for(df):
+    if df.empty:
+        return [
+            html.Div(
+                "Change the filters to generate insights.",
+                className="empty-insight",
+            )
+        ]
 
-    negative_rate = (data["Sentiment"] == "Negative").mean()
-    positive_rate = (data["Sentiment"] == "Positive").mean()
-    resolution_rate = (data["Resolved"] == "Y").mean()
+    total = len(df)
+    positive = (df["Sentiment"] == "Positive").sum()
+    negative = (df["Sentiment"] == "Negative").sum()
+    resolved = (df["ResolvedStatus"] == "Resolved").sum()
 
-    unresolved_negative = int(
+    items = [
         (
-            (data["Sentiment"] == "Negative")
-            & (data["Resolved"] == "N")
-        ).sum()
-    )
-
-    cards = [
-        (
-            "warning" if negative_rate >= 0.25 else "success",
-            "Negative sentiment",
-            f"{negative_rate:.1%} of filtered calls are negative.",
-        ),
-        (
-            "success" if resolution_rate >= 0.75 else "warning",
-            "Resolution performance",
-            f"{resolution_rate:.1%} of filtered calls are resolved.",
-        ),
-        (
-            "danger" if unresolved_negative else "success",
-            "Unresolved negative calls",
-            f"{unresolved_negative:,} calls are negative and unresolved.",
-        ),
-        (
-            "info",
             "Positive customer experience",
-            f"{positive_rate:.1%} of filtered calls are positive.",
+            f"{positive / total * 100:.1f}% of selected calls have positive sentiment.",
+            "bi-emoji-smile",
+            C["green"],
+        ),
+        (
+            "Resolution performance",
+            f"{resolved / total * 100:.1f}% of selected calls are marked resolved.",
+            "bi-check2-circle",
+            C["blue"],
+        ),
+        (
+            "Customer satisfaction",
+            f"Average satisfaction is {df['Satisfaction rating'].mean():.2f} out of 5.",
+            "bi-star",
+            C["orange"],
+        ),
+        (
+            "Average call duration",
+            f"The average call lasts {format_duration(df['DurationSeconds'].mean())}.",
+            "bi-clock",
+            C["purple"],
         ),
     ]
 
-    return dbc.Row([
-        dbc.Col(
-            dbc.Alert([
-                html.Div(title, className="fw-bold mb-1"),
-                html.Div(message, className="small"),
-            ], color=color, className="insight-alert"),
-            xs=12,
-            md=6,
-            xl=3,
-            className="mb-2",
+    negative_rate = negative / total * 100
+    if negative_rate >= 25:
+        items.append(
+            (
+                "Review negative calls",
+                f"{negative_rate:.1f}% of selected calls have negative sentiment.",
+                "bi-exclamation-circle",
+                C["red"],
+            )
         )
-        for color, title, message in cards
-    ])
+
+    return [
+        html.Div(
+            [
+                html.Div(
+                    html.I(className=f"bi {icon}"),
+                    className="insight-icon",
+                    style={"color": color, "background": f"{color}16"},
+                ),
+                html.Div(
+                    [
+                        html.Div(title, className="insight-title"),
+                        html.Div(text, className="insight-text"),
+                    ]
+                ),
+            ],
+            className="insight-item",
+        )
+        for title, text, icon, color in items
+    ]
+
+
+def sentiment_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    counts = df["Sentiment"].value_counts().reindex(
+        ["Positive", "Neutral", "Negative"], fill_value=0
+    )
+
+    fig = go.Figure(
+        go.Pie(
+            labels=counts.index,
+            values=counts.values,
+            hole=0.67,
+            sort=False,
+            marker=dict(
+                colors=[SENTIMENT_COLORS[x] for x in counts.index],
+                line=dict(color="white", width=3),
+            ),
+            textinfo="percent",
+            hovertemplate="%{label}: %{value} calls (%{percent})<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        annotations=[
+            dict(
+                text=f"<b>{len(df):,}</b><br><span style='font-size:10px'>Calls</span>",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=20, color=C["text"]),
+            )
+        ],
+        showlegend=True,
+        legend=dict(orientation="h", y=-0.12, x=0.02),
+    )
+    return style_fig(fig)
+
+
+def monthly_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    monthly = df.groupby(["Month", "Sentiment"]).size().reset_index(name="Calls")
+    fig = px.line(
+        monthly,
+        x="Month",
+        y="Calls",
+        color="Sentiment",
+        markers=True,
+        color_discrete_map=SENTIMENT_COLORS,
+        category_orders={"Sentiment": ["Positive", "Neutral", "Negative"]},
+    )
+    fig.update_traces(line_width=2.5, marker_size=6)
+    fig.update_layout(xaxis_title="Month", yaxis_title="Calls", hovermode="x unified")
+    return style_fig(fig)
+
+
+def resolution_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    grouped = df.groupby(["ResolvedStatus", "Sentiment"]).size().reset_index(name="Calls")
+    fig = px.bar(
+        grouped,
+        x="ResolvedStatus",
+        y="Calls",
+        color="Sentiment",
+        barmode="stack",
+        color_discrete_map=SENTIMENT_COLORS,
+    )
+    fig.update_layout(xaxis_title="Resolution status", yaxis_title="Calls")
+    return style_fig(fig)
+
+
+def rating_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    grouped = (
+        df["Satisfaction rating"].round().value_counts().sort_index()
+        .rename_axis("Rating").reset_index(name="Calls")
+    )
+    fig = px.bar(
+        grouped,
+        x="Rating",
+        y="Calls",
+        text="Calls",
+        color="Rating",
+        color_continuous_scale=["#C95454", "#C78326", "#258765"],
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        coloraxis_showscale=False,
+        xaxis_title="Satisfaction rating",
+        yaxis_title="Calls",
+        xaxis=dict(dtick=1),
+    )
+    return style_fig(fig)
+
+
+def duration_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    fig = px.box(
+        df,
+        x="Sentiment",
+        y="DurationMinutes",
+        color="Sentiment",
+        points="outliers",
+        color_discrete_map=SENTIMENT_COLORS,
+        category_orders={"Sentiment": ["Positive", "Neutral", "Negative"]},
+    )
+    fig.update_layout(
+        xaxis_title="Sentiment",
+        yaxis_title="Duration (minutes)",
+        showlegend=False,
+    )
+    return style_fig(fig)
+
+
+def negative_figure(df):
+    negative = df[df["Sentiment"] == "Negative"]
+    if negative.empty:
+        return empty_figure("No negative calls in this selection")
+
+    grouped = (
+        negative["ResolvedStatus"].value_counts()
+        .rename_axis("Resolution status").reset_index(name="Calls")
+    )
+    fig = px.bar(
+        grouped,
+        x="Resolution status",
+        y="Calls",
+        text="Calls",
+        color="Resolution status",
+        color_discrete_sequence=[C["red"], C["orange"], C["purple"]],
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="Resolution status",
+        yaxis_title="Negative calls",
+    )
+    return style_fig(fig)
+
+
+def duration_by_resolution_figure(df):
+    if df.empty:
+        return empty_figure()
+
+    grouped = (
+        df.groupby("ResolvedStatus")["DurationMinutes"]
+        .mean().reset_index(name="AverageMinutes")
+    )
+    fig = px.bar(
+        grouped,
+        x="ResolvedStatus",
+        y="AverageMinutes",
+        text="AverageMinutes",
+        color="ResolvedStatus",
+        color_discrete_sequence=[C["blue"], C["purple"], C["orange"]],
+    )
+    fig.update_traces(texttemplate="%{text:.1f} min", textposition="outside")
+    fig.update_layout(
+        showlegend=False,
+        xaxis_title="Resolution status",
+        yaxis_title="Average duration (minutes)",
+    )
+    return style_fig(fig)
 
 
 # ============================================================
-# DASH APPLICATION
+# UI STYLE
+# ============================================================
+
+CSS = r"""
+@import url('https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css');
+
+:root {
+  --page: #F4F6F9;
+  --card: #FFFFFF;
+  --text: #202B3C;
+  --muted: #748094;
+  --border: #E3E8EF;
+  --nav: #202A3B;
+  --blue: #3569C8;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; scroll-padding-top: 20px; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font-family: "Segoe UI", Arial, sans-serif;
+}
+
+.app-shell { min-height: 100vh; }
+
+.sidebar {
+  width: 232px;
+  min-width: 232px;
+  min-height: 100vh;
+  background: var(--nav);
+  color: white;
+  padding: 24px 15px;
+  align-self: stretch;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 3px 8px 28px;
+}
+
+.brand-icon {
+  height: 39px;
+  width: 39px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #34445C;
+  color: #EAF0F8;
+  border-radius: 10px;
+  font-size: 19px;
+}
+
+.brand-name { font-size: 15px; font-weight: 750; letter-spacing: -.2px; }
+.brand-subtitle { font-size: 9px; color: #AAB7C9; letter-spacing: 1.4px; margin-top: 3px; }
+.nav-heading { font-size: 10px; color: #94A3B8; letter-spacing: 1.4px; padding: 0 12px 8px; }
+
+.sidebar-nav { display: flex; flex-direction: column; gap: 4px; }
+
+.sidebar-link {
+  display: block;
+  padding: 11px 12px;
+  border-radius: 8px;
+  color: #C7D0DD;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.sidebar-link i { margin-right: 10px; font-size: 14px; }
+
+.sidebar-link:hover, .sidebar-link:focus {
+  background: #34445C;
+  color: white;
+  text-decoration: none;
+}
+
+.sidebar-note {
+  margin-top: 35px;
+  padding: 13px;
+  border: 1px solid #3A465A;
+  border-radius: 10px;
+  color: #B7C3D4;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.main-content { min-width: 0; flex: 1; padding: 27px 30px 36px; }
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+  margin-bottom: 23px;
+}
+
+.page-title { font-size: 27px; font-weight: 750; letter-spacing: -.7px; margin: 0; }
+.page-subtitle { font-size: 12px; color: var(--muted); margin: 7px 0 0; }
+
+.dataset-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: white;
+  color: #506078;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.dashboard-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 2px 7px rgba(28, 43, 67, .025);
+}
+
+.kpi-card { min-height: 132px; }
+.kpi-card .card-body { padding: 17px; }
+
+.kpi-icon {
+  height: 40px;
+  width: 40px;
+  min-width: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  font-size: 17px;
+}
+
+.kpi-label { color: var(--muted); font-size: 11px; font-weight: 650; }
+.kpi-value { font-size: 25px; font-weight: 750; letter-spacing: -.5px; margin-top: 4px; overflow-wrap: anywhere; }
+.kpi-note { font-size: 10px; color: var(--muted); margin-top: 13px; }
+
+.section-header { margin: 25px 0 13px; scroll-margin-top: 20px; }
+.section-title { font-size: 15px; font-weight: 750; margin: 0; }
+.section-subtitle { color: var(--muted); font-size: 11px; margin: 5px 0 0; }
+
+.filter-card .card-body { padding: 18px; }
+.filter-label { color: #536177; font-size: 10px; font-weight: 750; letter-spacing: .45px; margin-bottom: 7px; }
+
+.form-control, .form-select {
+  min-height: 38px;
+  border-color: #DDE3EC;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.form-control:focus, .form-select:focus {
+  border-color: #7D9DDD;
+  box-shadow: 0 0 0 2px #3569C81A;
+}
+
+.btn { border-radius: 7px; font-size: 11px; font-weight: 650; padding: 8px 12px; }
+.btn-primary { background: var(--blue); border-color: var(--blue); }
+.btn-primary:hover { background: #2C58A7; border-color: #2C58A7; }
+
+.filter-count { font-size: 11px; color: var(--muted); padding-top: 8px; }
+
+.chart-card .card-body { padding: 17px 17px 8px; }
+.chart-title { font-size: 12px; font-weight: 750; margin: 0; }
+.chart-subtitle { font-size: 10px; color: var(--muted); margin-top: 5px; }
+
+.insights-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.insight-item { display: flex; gap: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: white; }
+.insight-icon { height: 32px; width: 32px; min-width: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; }
+.insight-title { font-size: 11px; font-weight: 750; margin: 1px 0 5px; }
+.insight-text { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.empty-insight { font-size: 11px; color: var(--muted); padding: 10px; }
+
+.table-card .card-body { padding: 17px; }
+.table-summary, .saved-feedback { color: var(--muted); font-size: 11px; margin-top: 10px; }
+
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th {
+  background: #F5F7FA !important;
+  color: #536177 !important;
+  font-size: 10px !important;
+  font-weight: 750 !important;
+  border: none !important;
+}
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td {
+  font-size: 11px !important;
+  color: #354258 !important;
+  border: none !important;
+  border-bottom: 1px solid #EDF0F5 !important;
+}
+
+.calendar-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.calendar-presets .btn { padding: 6px 10px; font-size: 10px; }
+
+.DateRangePicker, .DateRangePickerInput { border-radius: 7px; }
+.DateInput { width: 105px; }
+.DateInput_input { font-size: 11px; padding: 8px 6px; border-radius: 7px; }
+.DateRangePickerInput { border: 1px solid #DDE3EC; }
+.DateRangePickerInput_arrow { color: #8A95A6; }
+.CalendarDay__selected, .CalendarDay__selected:active, .CalendarDay__selected:hover {
+  background: #3569C8; border-color: #3569C8; color: white;
+}
+.CalendarDay__selected_span { background: #E1EAF9; border-color: #D2DFF4; color: #253D66; }
+.CalendarDay__hovered_span, .CalendarDay__hovered_span:hover { background: #EDF2FB; border-color: #DDE6F6; color: #253D66; }
+.DayPicker, .DayPicker__withBorder { border-radius: 10px; box-shadow: 0 8px 24px #1C2B431A; }
+
+.footer-note { text-align: center; color: #8C97A8; font-size: 10px; margin-top: 27px; }
+
+@media (max-width: 1000px) {
+  .sidebar { width: 195px; min-width: 195px; }
+  .main-content { padding: 22px 18px; }
+  .kpi-value { font-size: 22px; }
+}
+
+@media (max-width: 760px) {
+  .app-shell { display: block !important; }
+  .sidebar { width: 100%; min-width: 100%; min-height: auto; padding: 13px; }
+  .brand { padding: 2px 6px 12px; }
+  .sidebar-nav { flex-direction: row; flex-wrap: wrap; }
+  .sidebar-link { padding: 8px 9px; font-size: 10px; }
+  .sidebar-note, .nav-heading { display: none; }
+  .main-content { padding: 18px 12px 26px; }
+  .page-title { font-size: 22px; }
+  .dataset-badge { font-size: 0; }
+  .insights-grid { grid-template-columns: 1fr; }
+}
+"""
+
+
+# ============================================================
+# APP SETUP
 # ============================================================
 
 app = dash.Dash(
     __name__,
     external_stylesheets=[
         dbc.themes.BOOTSTRAP,
-        dbc.icons.BOOTSTRAP,
+        "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css",
     ],
     title=APP_TITLE,
-    meta_tags=[{
-        "name": "viewport",
-        "content": "width=device-width, initial-scale=1",
-    }],
 )
-
 server = app.server
 
-app.index_string = """<!DOCTYPE html>
+app.index_string = f"""
+<!DOCTYPE html>
 <html>
 <head>
-{%metas%}
-<title>{%title%}</title>
-{%favicon%}
-{%css%}
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-:root{--background:#f4f6fb;--surface:#fff;--ink:#17233f;--muted:#758198;--border:#e9edf5;--primary:#4f6bed}
-*{box-sizing:border-box}
-html{scroll-behavior:smooth;scroll-padding-top:20px}
-body{background:var(--background);color:var(--ink);font-family:'DM Sans',sans-serif}
-.page-shell{max-width:1700px;margin:auto;padding:24px}
-.sidebar{background:linear-gradient(180deg,#111a31,#203457);color:white;border-radius:22px;padding:23px 15px;min-height:calc(100vh - 48px)}
-.brand-mark{height:42px;width:42px;flex-shrink:0;border-radius:13px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#8995ff,#4f6bed);font-size:18px;font-weight:800;color:white}
-.brand-name{font-family:Manrope,sans-serif;font-weight:800;font-size:17px}
-.sidebar-caption{font-size:10px;font-weight:800;letter-spacing:1.6px;color:#aab7d0;margin:28px 10px 10px}
-.sidebar .nav-link{color:#bdc8dc;border-radius:11px;padding:11px 12px;margin:3px 0;font-weight:600;font-size:13px}
-.sidebar .nav-link:hover,.sidebar .nav-link.active{color:white;background:#ffffff19}
-.sidebar-foot{font-size:12px;color:#aab7d0;line-height:1.7;overflow-wrap:anywhere}
-.content-area{padding-left:8px}
-.eyebrow{font-size:11px;font-weight:800;letter-spacing:1.5px;color:var(--primary)}
-.page-title{font-family:Manrope,sans-serif;font-size:clamp(26px,3vw,36px);font-weight:800;letter-spacing:-1px;margin:5px 0}
-.page-subtitle{color:var(--muted);font-size:14px;margin:0}
-.topline{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:24px}
-.status-pill{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;background:#e8f8ef;color:#15803d;border-radius:50px;padding:9px 13px;font-size:12px;font-weight:700}
-.status-dot{width:7px;height:7px;border-radius:50%;background:#22c55e}
-.metric-card,.panel-card,.filter-card{background:var(--surface);border:1px solid var(--border);border-radius:17px;box-shadow:0 5px 22px #26395d08}
-.metric-card{transition:transform .18s ease,box-shadow .18s ease}
-.metric-card:hover{transform:translateY(-3px);box-shadow:0 12px 26px #26395d12}
-.metric-label{color:var(--muted);font-size:11px;font-weight:800;letter-spacing:.7px}
-.metric-icon{width:38px;height:38px;flex-shrink:0;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px}
-.metric-value{font-family:Manrope,sans-serif;font-weight:800;font-size:clamp(22px,2vw,30px);letter-spacing:-1px;margin-top:14px;line-height:1.2;overflow-wrap:anywhere}
-.metric-note{font-size:12px;color:var(--muted);margin-top:7px}
-.section-heading{font-family:Manrope,sans-serif;font-weight:800;font-size:19px;letter-spacing:-.4px}
-.section-description{font-size:13px;color:var(--muted);margin-top:4px}
-.filter-card{padding:20px}
-.form-label{font-size:12px;font-weight:700;color:#45536b;margin-bottom:7px}
-.form-control,.btn{border-radius:10px!important}
-.btn{font-weight:700}
-.insight-alert{border:0;border-radius:13px;min-height:88px}
-.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner th{background:#f7f8fc!important;color:#66728a!important;font-size:11px!important;text-transform:uppercase;letter-spacing:.5px}
-.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td{font-size:13px!important}
-.footer{color:#98a2b3;font-size:12px;padding:24px 0 5px;text-align:center}
-.saved-view{border:1px solid var(--border);border-radius:13px;background:#fff;padding:14px}
-@media(max-width:991px){.page-shell{padding:14px}.sidebar{min-height:auto;margin-bottom:16px}.sidebar-caption,.sidebar-foot{display:none}.sidebar .nav{flex-direction:row!important;flex-wrap:wrap}.sidebar .nav-link{padding:8px 10px}.content-area{padding-left:0}}
-@media(max-width:575px){.page-shell{padding:9px}.sidebar{padding:15px}.filter-card{padding:14px}.topline{align-items:flex-start;flex-direction:column}.status-pill{white-space:normal}}
-</style>
+    {{%metas%}}
+    <title>{{%title%}}</title>
+    {{%favicon%}}
+    {{%css%}}
+    <style>{CSS}</style>
 </head>
 <body>
-{%app_entry%}
-<footer>
-{%config%}
-{%scripts%}
-{%renderer%}
-</footer>
+    {{%app_entry%}}
+    <footer>
+        {{%config%}}
+        {{%scripts%}}
+        {{%renderer%}}
+    </footer>
 </body>
-</html>"""
+</html>
+"""
 
 
 # ============================================================
-# PAGE LAYOUT
+# SIDEBAR AND FILTER CONTROLS
 # ============================================================
 
-app.layout = dbc.Container(
-    fluid=True,
-    className="page-shell",
-    children=[
-        dbc.Row([
-            dbc.Col([
-                html.Div([
-                    html.Div("CC", className="brand-mark"),
-                    html.Div([
-                        html.Div("CallCenter", className="brand-name"),
-                        html.Div(
-                            "INTELLIGENCE",
-                            style={
-                                "fontSize": "9px",
-                                "letterSpacing": "1.8px",
-                                "color": "#aab7d0",
-                            },
-                        ),
-                    ]),
-                ], className="d-flex align-items-center gap-2 mb-4 px-2"),
+sidebar = html.Aside(
+    [
+        html.Div(
+            [
+                html.Div(
+                    html.I(className="bi bi-headset"),
+                    className="brand-icon",
+                ),
+                html.Div(
+                    [
+                        html.Div("Call Center", className="brand-name"),
+                        html.Div("PERFORMANCE ANALYTICS", className="brand-subtitle"),
+                    ]
+                ),
+            ],
+            className="brand",
+        ),
+        html.Div("WORKSPACE", className="nav-heading"),
+        html.Nav(
+            [
+                html.A(
+                    [html.I(className="bi bi-grid-1x2"), "Overview"],
+                    href="#overview",
+                    className="sidebar-link",
+                ),
+                html.A(
+                    [html.I(className="bi bi-pie-chart"), "Sentiment"],
+                    href="#sentiment",
+                    className="sidebar-link",
+                ),
+                html.A(
+                    [html.I(className="bi bi-table"), "Call explorer"],
+                    href="#call-explorer",
+                    className="sidebar-link",
+                ),
+                html.A(
+                    [html.I(className="bi bi-bookmark"), "Saved views"],
+                    href="#saved-views",
+                    className="sidebar-link",
+                ),
+            ],
+            className="sidebar-nav",
+        ),
+        html.Div(
+            [
+                html.Div(
+                    [html.I(className="bi bi-info-circle me-2"), "About this dashboard"],
+                    style={"fontWeight": "700", "marginBottom": "5px"},
+                ),
+                "Use the filters to explore customer satisfaction, "
+                "call outcomes and handling duration.",
+            ],
+            className="sidebar-note",
+        ),
+    ],
+    className="sidebar",
+)
 
-                html.Div("WORKSPACE", className="sidebar-caption"),
-                dbc.Nav([
-                    dbc.NavLink(
-                        [html.I(className="bi bi-grid-1x2 me-2"), "Overview"],
-                        href="#overview",
-                    ),
-                    dbc.NavLink(
-                        [html.I(className="bi bi-emoji-smile me-2"), "Sentiment"],
-                        href="#sentiment",
-                    ),
-                    dbc.NavLink(
-                        [html.I(className="bi bi-telephone me-2"), "Call explorer"],
-                        href="#calls",
-                    ),
-                    dbc.NavLink(
-                        [html.I(className="bi bi-bookmark-star me-2"), "Saved views"],
-                        href="#saved",
-                    ),
-                ], vertical=True, pills=True),
+date_picker = dcc.DatePickerRange(
+    id="date-filter",
+    min_date_allowed=MIN_DATE,
+    max_date_allowed=MAX_DATE,
+    start_date=MIN_DATE,
+    end_date=MAX_DATE,
+    display_format="DD MMM YYYY",
+    minimum_nights=0,
+    number_of_months_shown=2,
+    updatemode="singledate",
+    clearable=False,
+    stay_open_on_select=False,
+)
 
-                html.Div("DATASET", className="sidebar-caption"),
-                html.Div([
-                    html.Div([
-                        html.I(
-                            className="bi bi-circle-fill me-2",
-                            style={"fontSize": "8px", "color": "#4ade80"},
-                        ),
-                        "Dataset loaded",
-                    ]),
-                    html.Div(f"{len(df):,} valid records", className="mt-2"),
-                    html.Div(
-                        "Done by Harsha Kyle, Mann and Manoj Kumar",
-                        className="mt-3",
-                    ),
-                ], className="sidebar-foot px-2"),
-            ], lg=2, md=12),
+sentiment_dropdown = dcc.Dropdown(
+    id="sentiment-filter",
+    options=[
+        {"label": "All sentiments", "value": "All"},
+        {"label": "Positive", "value": "Positive"},
+        {"label": "Neutral", "value": "Neutral"},
+        {"label": "Negative", "value": "Negative"},
+    ],
+    value="All",
+    clearable=False,
+)
 
-            dbc.Col([
-                html.Div([
-                    html.Div([
-                        html.Div("CUSTOMER EXPERIENCE / ANALYTICS", className="eyebrow"),
-                        html.H1("Customer Sentiment", className="page-title"),
-                        html.P(
-                            "Understand satisfaction, resolution outcomes, and call patterns.",
-                            className="page-subtitle",
-                        ),
-                    ]),
-                    html.Div([
-                        html.Span(className="status-dot"),
-                        " Dataset connected",
-                    ], className="status-pill"),
-                ], className="topline"),
+resolution_values = sorted(DF["ResolvedStatus"].dropna().unique().tolist())
+resolution_dropdown = dcc.Dropdown(
+    id="resolution-filter",
+    options=[
+        {"label": "All outcomes", "value": "All"},
+        *[{"label": value, "value": value} for value in resolution_values],
+    ],
+    value="All",
+    clearable=False,
+)
 
-                # Filters
-                html.Div([
-                    html.Div("FILTERS", className="eyebrow mb-1"),
-                    html.H4("Refine your analysis", className="section-heading mb-1"),
-                    html.P(
-                        "All charts, metrics, insights and records update with your selection.",
-                        className="section-description mb-3",
-                    ),
-                    dbc.Row([
-                        dbc.Col([
-                            html.Label("Sentiment", className="form-label"),
-                            dcc.Dropdown(
-                                id="sentiment-filter",
-                                options=[{"label": item, "value": item} for item in COLORS],
-                                value=[],
-                                multi=True,
-                                placeholder="All sentiments",
-                                clearable=True,
-                            ),
-                        ], xs=12, md=6, xl=3, className="mb-3"),
+duration_slider = dcc.RangeSlider(
+    id="duration-filter",
+    min=SLIDER_MIN,
+    max=SLIDER_MAX,
+    step=max((SLIDER_MAX - SLIDER_MIN) / 100, 0.1),
+    value=DEFAULT_DURATION,
+    marks={
+        int(SLIDER_MIN): format_duration(SLIDER_MIN),
+        int(SLIDER_MAX): format_duration(SLIDER_MAX),
+    },
+    tooltip={"placement": "bottom", "always_visible": False},
+    allowCross=False,
+)
 
-                        dbc.Col([
-                            html.Label("Date range", className="form-label"),
-                            dcc.DatePickerRange(
-                                id="date-picker",
-                                min_date_allowed=MIN_DATE,
-                                max_date_allowed=MAX_DATE,
-                                start_date=MIN_DATE,
-                                end_date=MAX_DATE,
-                                display_format="DD MMM YYYY",
-                                minimum_nights=0,
-                                clearable=True,
-                            ),
-                        ], xs=12, md=6, xl=4, className="mb-3"),
 
-                        dbc.Col([
-                            html.Label("Resolution", className="form-label"),
-                            dcc.Dropdown(
-                                id="resolved-filter",
-                                options=[
-                                    {"label": "Resolved", "value": "Y"},
-                                    {"label": "Unresolved", "value": "N"},
+# ============================================================
+# FILTER PANEL
+# ============================================================
+
+filters_panel = dbc.Card(
+    dbc.CardBody(
+        [
+            dbc.Row(
+                [
+                    dbc.Col(
+                        [
+                            html.Div("DATE RANGE", className="filter-label"),
+                            date_picker,
+                            html.Div(
+                                [
+                                    dbc.Button("Last 7 days", id="preset-7", color="light", size="sm", n_clicks=0),
+                                    dbc.Button("Last 30 days", id="preset-30", color="light", size="sm", n_clicks=0),
+                                    dbc.Button("All dates", id="preset-all", color="light", size="sm", n_clicks=0),
                                 ],
-                                value=None,
-                                placeholder="All calls",
-                                clearable=True,
+                                className="calendar-presets",
                             ),
-                        ], xs=12, md=6, xl=2, className="mb-3"),
-
-                        dbc.Col([
-                            html.Label("Duration (seconds)", className="form-label"),
-                            dcc.RangeSlider(
-                                id="duration-slider",
-                                min=SLIDER_MIN,
-                                max=SLIDER_MAX,
-                                step=SLIDER_STEP,
-                                value=DEFAULT_DURATION,
-                                marks={
-                                    round(SLIDER_MIN): str(round(SLIDER_MIN)),
-                                    round(SLIDER_MAX): str(round(SLIDER_MAX)),
-                                },
-                                tooltip={"placement": "bottom", "always_visible": False},
-                                allowCross=False,
+                        ],
+                        xs=12, xl=4,
+                    ),
+                    dbc.Col(
+                        [
+                            html.Div("SENTIMENT", className="filter-label"),
+                            sentiment_dropdown,
+                            html.Div("RESOLUTION", className="filter-label mt-3"),
+                            resolution_dropdown,
+                        ],
+                        xs=12, md=6, xl=4,
+                    ),
+                    dbc.Col(
+                        [
+                            html.Div("CALL DURATION", className="filter-label"),
+                            html.Div(
+                                "Drag either handle to set the duration range.",
+                                style={"fontSize": "10px", "color": C["muted"], "marginBottom": "15px"},
                             ),
-                        ], xs=12, md=6, xl=3, className="mb-3"),
-                    ]),
-                    html.Div([
-                        dbc.Button(
-                            [html.I(className="bi bi-arrow-counterclockwise me-2"), "Reset filters"],
-                            id="reset-filters",
-                            color="light",
-                            className="me-2",
-                        ),
-                        dbc.Button(
-                            [html.I(className="bi bi-download me-2"), "Export CSV"],
-                            id="export-btn",
-                            color="primary",
-                        ),
-                        dcc.Download(id="download-csv"),
-                        html.Span(
-                            id="filter-count",
-                            className="ms-auto text-secondary small align-self-center",
-                        ),
-                    ], className="d-flex flex-wrap gap-2 align-items-center"),
-                ], className="filter-card mb-4"),
+                            html.Div(duration_slider, style={"padding": "5px 8px 12px"}),
+                            html.Div(
+                                [
+                                    dbc.Button(
+                                        [html.I(className="bi bi-arrow-counterclockwise me-1"), "Reset"],
+                                        id="reset-filters-btn",
+                                        color="light",
+                                        className="me-2 mb-2",
+                                        n_clicks=0,
+                                    ),
+                                    dbc.Button(
+                                        [html.I(className="bi bi-download me-1"), "Export CSV"],
+                                        id="export-csv-btn",
+                                        color="primary",
+                                        className="mb-2",
+                                        n_clicks=0,
+                                    ),
+                                ],
+                                className="mt-3",
+                            ),
+                        ],
+                        xs=12, md=6, xl=4,
+                    ),
+                ],
+                className="g-3 align-items-start",
+            ),
+            html.Hr(style={"borderColor": C["border"], "margin": "18px 0 8px"}),
+            html.Div(id="filter-count", className="filter-count"),
+        ]
+    ),
+    className="dashboard-card filter-card",
+)
 
-                # KPIs
-                dbc.Row([
-                    dbc.Col(metric_card("TOTAL CALLS", "kpi-total", "kpi-total-note", "bi-telephone", BLUE),
-                            xs=6, xl=3, className="mb-3"),
-                    dbc.Col(metric_card("POSITIVE SENTIMENT", "kpi-positive", "kpi-positive-note", "bi-emoji-smile", "#16a34a"),
-                            xs=6, xl=3, className="mb-3"),
-                    dbc.Col(metric_card("RESOLUTION RATE", "kpi-resolution", "kpi-resolution-note", "bi-check2-circle", "#0ea5e9"),
-                            xs=6, xl=3, className="mb-3"),
-                    dbc.Col(metric_card("AVG. CALL DURATION", "kpi-duration", "kpi-duration-note", "bi-clock-history", "#8b5cf6"),
-                            xs=6, xl=3, className="mb-3"),
-                ]),
 
-                html.Div(id="insights-area", className="mb-3"),
+# ============================================================
+# PAGE SECTIONS
+# ============================================================
 
-                html.Div(id="overview", className="section-heading mb-1", children="Performance overview"),
+overview_section = html.Section(
+    [
+        html.Div(
+            [
+                html.H5("Performance overview", className="section-title"),
                 html.P(
-                    "A visual snapshot of customer experience and operational outcomes.",
-                    className="section-description mb-3",
+                    "Key indicators for the selected calls.",
+                    className="section-subtitle",
                 ),
-
-                dbc.Row([
-                    dbc.Col(chart_card("Sentiment mix", "Share of positive, neutral and negative calls", "sentiment-pie"),
-                            xs=12, lg=5, className="mb-3"),
-                    dbc.Col(chart_card("Sentiment over time", "Monthly call volume by sentiment", "sentiment-trend"),
-                            xs=12, lg=7, className="mb-3"),
-                    dbc.Col(chart_card("Resolution outcomes", "Sentiment distribution by resolution status", "resolution-bar"),
-                            xs=12, lg=6, className="mb-3"),
-                    dbc.Col(chart_card("Call duration", "Duration distribution by sentiment", "duration-box"),
-                            xs=12, lg=6, className="mb-3"),
-                    dbc.Col(chart_card("Negative calls by outcome", "Find negative calls that remain unresolved", "negative-sentiment"),
-                            xs=12, className="mb-3"),
-                ]),
-
-                html.Div(id="sentiment", className="section-heading mt-3 mb-1", children="Customer satisfaction analysis"),
+            ],
+            className="section-header",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    kpi_card("Total calls", "kpi-total", "kpi-total-note", "bi-telephone", C["blue"]),
+                    xs=12, sm=6, xl=3, className="mb-3",
+                ),
+                dbc.Col(
+                    kpi_card("Positive sentiment", "kpi-positive", "kpi-positive-note", "bi-emoji-smile", C["green"]),
+                    xs=12, sm=6, xl=3, className="mb-3",
+                ),
+                dbc.Col(
+                    kpi_card("Resolution rate", "kpi-resolution", "kpi-resolution-note", "bi-check2-circle", C["purple"]),
+                    xs=12, sm=6, xl=3, className="mb-3",
+                ),
+                dbc.Col(
+                    kpi_card("Average satisfaction", "kpi-rating", "kpi-rating-note", "bi-star", C["orange"]),
+                    xs=12, sm=6, xl=3, className="mb-3",
+                ),
+            ],
+            className="g-3",
+        ),
+        html.Div(
+            [
+                html.H5("Highlights", className="section-title"),
                 html.P(
-                    "Explore rating patterns and average call handling time.",
-                    className="section-description mb-3",
+                    "Automatically generated observations based on the current filters.",
+                    className="section-subtitle",
                 ),
+            ],
+            className="section-header",
+        ),
+        html.Div(id="insights-container", className="insights-grid"),
+    ],
+    id="overview",
+)
 
-                dbc.Row([
-                    dbc.Col(chart_card("Satisfaction ratings", "Number of calls at each rating level", "rating-distribution"),
-                            xs=12, md=6, className="mb-3"),
-                    dbc.Col(chart_card("Duration by resolution", "Average handling time for each outcome", "duration-resolution"),
-                            xs=12, md=6, className="mb-3"),
-                ]),
-
-                html.Div(id="calls", className="section-heading mt-3 mb-1", children="Call explorer"),
+sentiment_section = html.Section(
+    [
+        html.Div(
+            [
+                html.H5("Sentiment and trends", className="section-title"),
                 html.P(
-                    "Search, sort, and inspect records from the filtered dataset.",
-                    className="section-description mb-3",
+                    "Explore customer sentiment, satisfaction and resolution patterns.",
+                    className="section-subtitle",
                 ),
+            ],
+            className="section-header",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    chart_card("Sentiment distribution", "Share of calls by sentiment.", "sentiment-chart"),
+                    xs=12, lg=5, className="mb-3",
+                ),
+                dbc.Col(
+                    chart_card("Monthly sentiment trend", "Call volumes by sentiment over time.", "monthly-chart"),
+                    xs=12, lg=7, className="mb-3",
+                ),
+            ],
+            className="g-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    chart_card("Resolution outcomes", "Resolution status split by sentiment.", "resolution-chart"),
+                    xs=12, lg=6, className="mb-3",
+                ),
+                dbc.Col(
+                    chart_card("Satisfaction rating", "Frequency of each rating.", "rating-chart"),
+                    xs=12, lg=6, className="mb-3",
+                ),
+            ],
+            className="g-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    chart_card("Negative calls by outcome", "Resolution status of negative-sentiment calls.", "negative-chart"),
+                    xs=12, lg=6, className="mb-3",
+                ),
+                dbc.Col(
+                    chart_card("Average duration by outcome", "Average handling time for each resolution status.", "duration-resolution-chart"),
+                    xs=12, lg=6, className="mb-3",
+                ),
+            ],
+            className="g-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    chart_card("Call duration by sentiment", "Compare duration distributions across sentiment groups.", "duration-chart"),
+                    xs=12, className="mb-3",
+                ),
+            ],
+            className="g-3",
+        ),
+    ],
+    id="sentiment",
+)
 
-                dbc.Card(
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
+call_explorer_section = html.Section(
+    [
+        html.Div(
+            [
+                html.H5("Call explorer", className="section-title"),
+                html.P(
+                    "Search records, sort columns and use the table's column filters.",
+                    className="section-subtitle",
+                ),
+            ],
+            className="section-header",
+        ),
+        dbc.Card(
+            dbc.CardBody(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(
                                 dbc.Input(
                                     id="table-search",
-                                    placeholder="Search date, rating, sentiment or status...",
+                                    placeholder="Search call ID, date, sentiment, resolution or duration...",
                                     type="text",
                                     debounce=True,
                                 ),
-                            ], xs=12, md=7),
-                            dbc.Col([
-                                html.Div(
-                                    id="table-summary",
-                                    className="text-secondary small text-md-end pt-2",
-                                ),
-                            ], xs=12, md=5),
-                        ], className="mb-3"),
-
-                        dash_table.DataTable(
-                            id="calls-table",
-                            columns=[
-                                {"name": "Date", "id": "Date"},
-                                {"name": "Satisfaction", "id": "Satisfaction rating", "type": "numeric"},
-                                {"name": "Sentiment", "id": "Sentiment"},
-                                {"name": "Resolution", "id": "Resolution"},
-                                {"name": "Duration (s)", "id": "AvgTalkDuration", "type": "numeric"},
-                            ],
-                            data=[],
-                            page_size=10,
-                            page_action="native",
-                            sort_action="native",
-                            filter_action="native",
-                            sort_mode="multi",
-                            export_format="csv",
-                            export_headers="display",
-                            style_table={"overflowX": "auto"},
-                            style_cell={
-                                "padding": "12px",
-                                "fontFamily": "DM Sans, sans-serif",
-                                "fontSize": "13px",
-                                "textAlign": "left",
-                                "minWidth": "100px",
-                                "maxWidth": "240px",
-                                "whiteSpace": "normal",
-                                "height": "auto",
-                                "border": "none",
-                            },
-                            style_header={
-                                "backgroundColor": "#f7f8fc",
-                                "fontWeight": "800",
-                                "color": "#66728a",
-                                "border": "none",
-                            },
-                            style_data={
-                                "borderBottom": "1px solid #edf1f7",
-                                "color": NAVY,
-                            },
-                            style_data_conditional=[
-                                {
-                                    "if": {
-                                        "filter_query": '{Sentiment} = "Positive"',
-                                        "column_id": "Sentiment",
-                                    },
-                                    "color": "#15803d",
-                                    "fontWeight": "700",
-                                },
-                                {
-                                    "if": {
-                                        "filter_query": '{Sentiment} = "Neutral"',
-                                        "column_id": "Sentiment",
-                                    },
-                                    "color": "#b77905",
-                                    "fontWeight": "700",
-                                },
-                                {
-                                    "if": {
-                                        "filter_query": '{Sentiment} = "Negative"',
-                                        "column_id": "Sentiment",
-                                    },
-                                    "color": "#dc2626",
-                                    "fontWeight": "700",
-                                },
-                            ],
-                        ),
-                    ]),
-                    className="panel-card mb-4",
-                ),
-
-                # Saved views
-                html.Div(id="saved", className="section-heading mt-3 mb-1", children="Saved filter views"),
-                html.P(
-                    "Save, apply, refresh or delete filter setups stored in SQLite.",
-                    className="section-description mb-3",
-                ),
-
-                dbc.Card(
-                    dbc.CardBody([
-                        dbc.Row([
-                            dbc.Col([
-                                dbc.Input(
-                                    id="view-name",
-                                    placeholder="Optional name for this view",
-                                    type="text",
-                                    maxLength=80,
-                                ),
-                            ], xs=12, md=5, className="mb-2"),
-                            dbc.Col([
+                                xs=12, md=9,
+                            ),
+                            dbc.Col(
                                 dbc.Button(
-                                    [html.I(className="bi bi-bookmark-plus me-2"), "Save current view"],
-                                    id="save-view-btn",
-                                    color="primary",
-                                    className="w-100",
-                                ),
-                            ], xs=12, md=3, className="mb-2"),
-                            dbc.Col([
-                                dbc.Button(
-                                    [html.I(className="bi bi-arrow-clockwise me-2"), "Refresh"],
-                                    id="view-past-btn",
+                                    [html.I(className="bi bi-x-circle me-1"), "Clear search"],
+                                    id="clear-search-btn",
                                     color="light",
                                     className="w-100",
+                                    n_clicks=0,
                                 ),
-                            ], xs=6, md=2, className="mb-2"),
-                            dbc.Col([
+                                xs=12, md=3,
+                            ),
+                        ],
+                        className="g-2 mb-3",
+                    ),
+                    dash_table.DataTable(
+                        id="calls-table",
+                        columns=[
+                            {"name": "Call ID", "id": "CallID"},
+                            {"name": "Date", "id": "CallDate"},
+                            {"name": "Rating", "id": "Satisfaction rating", "type": "numeric"},
+                            {"name": "Sentiment", "id": "Sentiment"},
+                            {"name": "Resolution", "id": "ResolvedStatus"},
+                            {"name": "Duration", "id": "DurationLabel"},
+                            {"name": "Minutes", "id": "DurationMinutes", "type": "numeric"},
+                        ],
+                        data=[],
+                        page_action="native",
+                        page_current=0,
+                        page_size=10,
+                        sort_action="native",
+                        sort_mode="multi",
+                        filter_action="native",
+                        fixed_rows={"headers": True},
+                        style_table={"overflowX": "auto", "minWidth": "100%"},
+                        style_cell={
+                            "padding": "11px 12px",
+                            "fontFamily": "Segoe UI, Arial, sans-serif",
+                            "fontSize": "11px",
+                            "textAlign": "left",
+                            "minWidth": "85px",
+                            "maxWidth": "230px",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                        },
+                        style_header={
+                            "backgroundColor": "#F5F7FA",
+                            "fontWeight": "700",
+                            "border": "none",
+                        },
+                        style_data={"backgroundColor": "white", "border": "none"},
+                        style_data_conditional=[
+                            {
+                                "if": {"filter_query": '{Sentiment} = "Positive"', "column_id": "Sentiment"},
+                                "color": C["green"], "fontWeight": "700",
+                            },
+                            {
+                                "if": {"filter_query": '{Sentiment} = "Neutral"', "column_id": "Sentiment"},
+                                "color": C["orange"], "fontWeight": "700",
+                            },
+                            {
+                                "if": {"filter_query": '{Sentiment} = "Negative"', "column_id": "Sentiment"},
+                                "color": C["red"], "fontWeight": "700",
+                            },
+                        ],
+                    ),
+                    html.Div(id="table-summary", className="table-summary"),
+                ]
+            ),
+            className="dashboard-card table-card",
+        ),
+    ],
+    id="call-explorer",
+)
+
+initial_views = get_saved_views()
+
+saved_views_section = html.Section(
+    [
+        html.Div(
+            [
+                html.H5("Saved views", className="section-title"),
+                html.P(
+                    "Save the current filters and load them again later.",
+                    className="section-subtitle",
+                ),
+            ],
+            className="section-header",
+        ),
+        dbc.Card(
+            dbc.CardBody(
+                [
+                    dbc.Row(
+                        [
+                            dbc.Col(
+                                [
+                                    html.Div("VIEW NAME", className="filter-label"),
+                                    dbc.Input(
+                                        id="saved-view-name",
+                                        placeholder="e.g. Negative calls in the last month",
+                                        maxLength=80,
+                                        type="text",
+                                    ),
+                                ],
+                                xs=12, md=5,
+                            ),
+                            dbc.Col(
+                                [
+                                    html.Div("CHOOSE A SAVED VIEW", className="filter-label"),
+                                    dcc.Dropdown(
+                                        id="saved-view-select",
+                                        options=make_saved_view_options(initial_views),
+                                        value=None,
+                                        placeholder="Select a saved view...",
+                                        clearable=True,
+                                    ),
+                                ],
+                                xs=12, md=5,
+                            ),
+                            dbc.Col(
+                                [
+                                    html.Div("ACTIONS", className="filter-label"),
+                                    html.Div(
+                                        [
+                                            dbc.Button(
+                                                "Save current",
+                                                id="save-view-btn",
+                                                color="primary",
+                                                className="me-2 mb-2",
+                                                n_clicks=0,
+                                            ),
+                                            dbc.Button(
+                                                "Load view",
+                                                id="load-view-btn",
+                                                color="light",
+                                                className="mb-2",
+                                                n_clicks=0,
+                                            ),
+                                        ],
+                                        className="d-flex flex-wrap",
+                                    ),
+                                ],
+                                xs=12, md=2,
+                            ),
+                        ],
+                        className="g-3 align-items-end",
+                    ),
+                    html.Div(id="saved-feedback", className="saved-feedback"),
+                    html.Hr(style={"borderColor": C["border"], "margin": "18px 0"}),
+                    dbc.Row(
+                        [
+                            dbc.Col(
                                 dbc.Button(
-                                    [html.I(className="bi bi-trash me-2"), "Delete all"],
-                                    id="delete-all-btn",
+                                    [html.I(className="bi bi-arrow-clockwise me-1"), "Refresh list"],
+                                    id="refresh-views-btn",
+                                    color="light",
+                                    n_clicks=0,
+                                ),
+                                xs=12, md="auto",
+                            ),
+                            dbc.Col(
+                                dbc.Button(
+                                    [html.I(className="bi bi-trash3 me-1"), "Delete all views"],
+                                    id="delete-all-views-btn",
                                     color="danger",
                                     outline=True,
-                                    className="w-100",
+                                    n_clicks=0,
                                 ),
-                            ], xs=6, md=2, className="mb-2"),
-                        ]),
-                        html.Div(id="saved-feedback", className="mb-2"),
-                        html.Div(id="past-data-output"),
-                    ]),
-                    className="panel-card mb-3",
-                ),
-
-                html.Div(
-                    "Built with Python · Dash · Pandas · Plotly · SQLite | "
-                    "Done by Harsha Kyle, Mann and Manoj Kumar",
-                    className="footer",
-                ),
-            ], lg=10, md=12, className="content-area"),
-        ], className="g-3"),
+                                xs=12, md="auto",
+                            ),
+                        ],
+                        className="g-2",
+                    ),
+                    html.Div(id="saved-views-table", className="mt-3"),
+                ]
+            ),
+            className="dashboard-card",
+        ),
     ],
+    id="saved-views",
 )
 
 
 # ============================================================
-# RESET FILTERS
+# FULL LAYOUT
 # ============================================================
 
-@app.callback(
-    Output("sentiment-filter", "value"),
-    Output("date-picker", "start_date"),
-    Output("date-picker", "end_date"),
-    Output("resolved-filter", "value"),
-    Output("duration-slider", "value"),
-    Output("table-search", "value"),
-    Input("reset-filters", "n_clicks"),
-    prevent_initial_call=True,
+app.layout = html.Div(
+    [
+        dcc.Store(id="saved-views-store", data=initial_views),
+        dcc.Download(id="download-csv"),
+        html.Div(
+            [
+                sidebar,
+                html.Main(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.H1(APP_TITLE, className="page-title"),
+                                        html.P(
+                                            "Customer experience and operational performance",
+                                            className="page-subtitle",
+                                        ),
+                                    ]
+                                ),
+                                html.Div(
+                                    [
+                                        html.I(className="bi bi-file-earmark-spreadsheet"),
+                                        f"  {DATA_FILE.name}  ·  {len(DF):,} records",
+                                    ],
+                                    className="dataset-badge",
+                                ),
+                            ],
+                            className="topbar",
+                        ),
+                        filters_panel,
+                        overview_section,
+                        sentiment_section,
+                        call_explorer_section,
+                        saved_views_section,
+                        html.Div(
+                            "Call Center Intelligence  ·  Customer experience analytics",
+                            className="footer-note",
+                        ),
+                    ],
+                    className="main-content",
+                ),
+            ],
+            className="app-shell d-flex",
+        ),
+    ]
 )
-def reset_filters(_):
-    return [], MIN_DATE, MAX_DATE, None, DEFAULT_DURATION, ""
 
 
 # ============================================================
-# DASHBOARD CALLBACK
+# MAIN DASHBOARD CALLBACK
 # ============================================================
 
 @app.callback(
@@ -950,239 +1517,161 @@ def reset_filters(_):
     Output("kpi-positive-note", "children"),
     Output("kpi-resolution", "children"),
     Output("kpi-resolution-note", "children"),
-    Output("kpi-duration", "children"),
-    Output("kpi-duration-note", "children"),
+    Output("kpi-rating", "children"),
+    Output("kpi-rating-note", "children"),
     Output("filter-count", "children"),
-    Output("insights-area", "children"),
-    Output("sentiment-pie", "figure"),
-    Output("sentiment-trend", "figure"),
-    Output("resolution-bar", "figure"),
-    Output("duration-box", "figure"),
-    Output("negative-sentiment", "figure"),
-    Output("rating-distribution", "figure"),
-    Output("duration-resolution", "figure"),
+    Output("insights-container", "children"),
+    Output("sentiment-chart", "figure"),
+    Output("monthly-chart", "figure"),
+    Output("resolution-chart", "figure"),
+    Output("rating-chart", "figure"),
+    Output("negative-chart", "figure"),
+    Output("duration-resolution-chart", "figure"),
+    Output("duration-chart", "figure"),
     Output("calls-table", "data"),
     Output("table-summary", "children"),
+    Input("date-filter", "start_date"),
+    Input("date-filter", "end_date"),
     Input("sentiment-filter", "value"),
-    Input("date-picker", "start_date"),
-    Input("date-picker", "end_date"),
-    Input("resolved-filter", "value"),
-    Input("duration-slider", "value"),
+    Input("resolution-filter", "value"),
+    Input("duration-filter", "value"),
     Input("table-search", "value"),
 )
-def update_dashboard(sentiments, start_date, end_date, resolved, duration_range, search):
-    data = filter_data(sentiments, start_date, end_date, resolved, duration_range)
-    count = len(data)
+def update_dashboard(start_date, end_date, sentiment, resolution, duration_range, search):
+    df = filtered_data(start_date, end_date, sentiment, resolution, duration_range)
 
-    if data.empty:
+    if df.empty:
         empty = empty_figure()
         return (
-            "0", "No matching records",
-            "—", "No matching records",
-            "—", "No matching records",
-            "—", "No matching records",
-            "0 calls match these filters",
-            make_insights(data),
+            "0", "No calls match the selected filters",
+            "0%", "Positive calls",
+            "0%", "Resolved calls",
+            "—", "No satisfaction data",
+            "Showing 0 calls",
+            insights_for(df),
             empty, empty, empty, empty, empty, empty, empty,
             [],
-            "No records to display",
+            "No records found. Try adjusting the filters.",
         )
 
-    positive_rate = (data["Sentiment"] == "Positive").mean()
-    resolution_rate = (data["Resolved"] == "Y").mean()
-    average_duration = data["AvgTalkDuration"].mean()
+    total = len(df)
+    positive = int((df["Sentiment"] == "Positive").sum())
+    negative = int((df["Sentiment"] == "Negative").sum())
+    resolved = int((df["ResolvedStatus"] == "Resolved").sum())
+    positive_pct = positive / total * 100
+    negative_pct = negative / total * 100
+    resolved_pct = resolved / total * 100
+    average_rating = df["Satisfaction rating"].mean()
+    average_duration = df["DurationSeconds"].mean()
 
-    # Sentiment donut
-    sentiment_counts = (
-        data["Sentiment"]
-        .value_counts()
-        .reindex(["Positive", "Neutral", "Negative"], fill_value=0)
-        .rename_axis("Sentiment")
-        .reset_index(name="Calls")
-    )
-    sentiment_counts = sentiment_counts[sentiment_counts["Calls"] > 0]
+    table_df = df.copy()
 
-    pie = px.pie(
-        sentiment_counts,
-        names="Sentiment",
-        values="Calls",
-        hole=0.64,
-        color="Sentiment",
-        color_discrete_map=COLORS,
-        category_orders={"Sentiment": ["Positive", "Neutral", "Negative"]},
-    )
-    pie.update_traces(
-        textposition="outside",
-        textinfo="percent",
-        hovertemplate="%{label}: %{value} calls (%{percent})<extra></extra>",
-        marker={"line": {"color": "white", "width": 3}},
-    )
-    pie.add_annotation(
-        text=f"<b>{count:,}</b><br><span style='font-size:11px'>calls</span>",
-        x=0.5,
-        y=0.5,
-        showarrow=False,
-        font={"size": 22, "color": NAVY},
-    )
-
-    # Monthly sentiment trend
-    monthly = (
-        data.assign(Month=data["Date"].dt.to_period("M").astype(str))
-        .groupby(["Month", "Sentiment"])
-        .size()
-        .reset_index(name="Calls")
-    )
-    trend = px.line(
-        monthly,
-        x="Month",
-        y="Calls",
-        color="Sentiment",
-        markers=True,
-        color_discrete_map=COLORS,
-        category_orders={"Sentiment": ["Positive", "Neutral", "Negative"]},
-    )
-    trend.update_traces(line={"width": 3}, marker={"size": 7})
-
-    # Resolution outcomes
-    resolution_data = (
-        data.groupby(["Resolution", "Sentiment"])
-        .size()
-        .reset_index(name="Calls")
-    )
-    resolution = px.bar(
-        resolution_data,
-        x="Resolution",
-        y="Calls",
-        color="Sentiment",
-        barmode="stack",
-        color_discrete_map=COLORS,
-        category_orders={
-            "Resolution": ["Resolved", "Unresolved"],
-            "Sentiment": ["Positive", "Neutral", "Negative"],
-        },
-    )
-
-    # Call duration distribution
-    duration = px.box(
-        data,
-        x="Sentiment",
-        y="AvgTalkDuration",
-        color="Sentiment",
-        color_discrete_map=COLORS,
-        points="outliers",
-        category_orders={"Sentiment": ["Positive", "Neutral", "Negative"]},
-    )
-    duration.update_yaxes(title="Duration (seconds)")
-
-    # Negative calls by resolution
-    negative_counts = (
-        data[data["Sentiment"] == "Negative"]
-        .groupby("Resolution")
-        .size()
-        .reindex(["Resolved", "Unresolved"], fill_value=0)
-        .rename("Calls")
-        .reset_index()
-    )
-    negative = px.bar(
-        negative_counts,
-        x="Resolution",
-        y="Calls",
-        color="Resolution",
-        color_discrete_map={"Resolved": "#16a34a", "Unresolved": "#ef4444"},
-        category_orders={"Resolution": ["Resolved", "Unresolved"]},
-    )
-    negative.update_layout(showlegend=False)
-
-    # Satisfaction rating distribution
-    rating_data = (
-        data.groupby("Satisfaction rating")
-        .size()
-        .reset_index(name="Calls")
-        .sort_values("Satisfaction rating")
-    )
-    rating_fig = px.bar(
-        rating_data,
-        x="Satisfaction rating",
-        y="Calls",
-        color="Satisfaction rating",
-        color_continuous_scale=["#ef4444", "#f59e0b", "#16a34a"],
-    )
-    rating_fig.update_layout(coloraxis_showscale=False)
-    rating_fig.update_xaxes(title="Satisfaction rating", dtick=1)
-
-    # Average duration by resolution
-    duration_resolution_data = (
-        data.groupby("Resolution")["AvgTalkDuration"]
-        .mean()
-        .reindex(["Resolved", "Unresolved"])
-        .dropna()
-        .reset_index()
-    )
-    duration_resolution_fig = px.bar(
-        duration_resolution_data,
-        x="Resolution",
-        y="AvgTalkDuration",
-        color="Resolution",
-        color_discrete_map={"Resolved": "#4f6bed", "Unresolved": "#8b5cf6"},
-        category_orders={"Resolution": ["Resolved", "Unresolved"]},
-    )
-    duration_resolution_fig.update_layout(showlegend=False)
-    duration_resolution_fig.update_yaxes(title="Average duration (seconds)")
-
-    figures = [
-        style_figure(figure)
-        for figure in [
-            pie,
-            trend,
-            resolution,
-            duration,
-            negative,
-            rating_fig,
-            duration_resolution_fig,
+    if search and search.strip():
+        term = search.strip().lower()
+        columns = [
+            "CallID", "CallDate", "Sentiment", "ResolvedStatus",
+            "DurationLabel", "Satisfaction rating",
         ]
-    ]
-
-    # Prepare table data
-    table = data[
-        [
-            "Date",
-            "Satisfaction rating",
-            "Sentiment",
-            "Resolution",
-            "AvgTalkDuration",
-        ]
-    ].copy()
-
-    table["Date"] = table["Date"].dt.strftime("%Y-%m-%d")
-    table["Satisfaction rating"] = table["Satisfaction rating"].round(1)
-    table["AvgTalkDuration"] = table["AvgTalkDuration"].round(1)
-
-    if search and str(search).strip():
-        term = str(search).strip().lower()
-        mask = table.astype(str).apply(
-            lambda column: column.str.lower().str.contains(
-                term, regex=False, na=False
+        mask = pd.Series(False, index=table_df.index)
+        for column in columns:
+            mask |= table_df[column].astype(str).str.lower().str.contains(
+                re.escape(term), na=False
             )
-        ).any(axis=1)
-        table = table[mask]
+        table_df = table_df[mask]
 
-    table = table.sort_values("Date", ascending=False).to_dict("records")
+    table_columns = [
+        "CallID", "CallDate", "Satisfaction rating", "Sentiment",
+        "ResolvedStatus", "DurationLabel", "DurationMinutes",
+    ]
+    table_data = table_df[table_columns].copy()
+    table_data["DurationMinutes"] = table_data["DurationMinutes"].round(2)
 
     return (
-        f"{count:,}",
-        "Calls in current selection",
-        f"{positive_rate:.1%}",
-        "Rated 4 or 5",
-        f"{resolution_rate:.1%}",
-        "Marked as resolved",
-        seconds_label(average_duration),
-        "Mean talk duration",
-        f"{count:,} calls match these filters",
-        make_insights(data),
-        *figures,
-        table,
-        f"Showing {len(table):,} rows after search. Use column headers to sort or filter.",
+        f"{total:,}",
+        f"{negative:,} negative calls · {negative_pct:.1f}%",
+        f"{positive_pct:.1f}%",
+        f"{positive:,} positive calls",
+        f"{resolved_pct:.1f}%",
+        f"{resolved:,} resolved calls",
+        f"{average_rating:.2f}/5",
+        f"Average call: {format_duration(average_duration)}",
+        f"Showing {total:,} of {len(DF):,} calls",
+        insights_for(df),
+        sentiment_figure(df),
+        monthly_figure(df),
+        resolution_figure(df),
+        rating_figure(df),
+        negative_figure(df),
+        duration_by_resolution_figure(df),
+        duration_figure(df),
+        table_data.to_dict("records"),
+        f"{len(table_data):,} matching records before table pagination.",
     )
+
+
+# ============================================================
+# DATE PRESETS
+# ============================================================
+
+@app.callback(
+    Output("date-filter", "start_date"),
+    Output("date-filter", "end_date"),
+    Input("preset-7", "n_clicks"),
+    Input("preset-30", "n_clicks"),
+    Input("preset-all", "n_clicks"),
+    prevent_initial_call=True,
+)
+def set_date_preset(click_7, click_30, click_all):
+    triggered = ctx.triggered_id
+
+    if triggered == "preset-all":
+        return MIN_DATE, MAX_DATE
+
+    if triggered == "preset-7":
+        days = 7
+    elif triggered == "preset-30":
+        days = 30
+    else:
+        return no_update, no_update
+
+    end = MAX_DATE
+    start = max(MIN_DATE, end - timedelta(days=days - 1))
+    return start, end
+
+
+# ============================================================
+# RESET FILTERS
+# ============================================================
+
+@app.callback(
+    Output("date-filter", "start_date", allow_duplicate=True),
+    Output("date-filter", "end_date", allow_duplicate=True),
+    Output("sentiment-filter", "value"),
+    Output("resolution-filter", "value"),
+    Output("duration-filter", "value"),
+    Input("reset-filters-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def reset_filters(n_clicks):
+    if not n_clicks:
+        return (no_update,) * 5
+    return MIN_DATE, MAX_DATE, "All", "All", DEFAULT_DURATION
+
+
+# ============================================================
+# CLEAR SEARCH
+# ============================================================
+
+@app.callback(
+    Output("table-search", "value"),
+    Output("calls-table", "filter_query"),
+    Input("clear-search-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_search(n_clicks):
+    if not n_clicks:
+        return no_update, no_update
+    return "", ""
 
 
 # ============================================================
@@ -1191,296 +1680,258 @@ def update_dashboard(sentiments, start_date, end_date, resolved, duration_range,
 
 @app.callback(
     Output("download-csv", "data"),
-    Input("export-btn", "n_clicks"),
+    Input("export-csv-btn", "n_clicks"),
+    State("date-filter", "start_date"),
+    State("date-filter", "end_date"),
     State("sentiment-filter", "value"),
-    State("date-picker", "start_date"),
-    State("date-picker", "end_date"),
-    State("resolved-filter", "value"),
-    State("duration-slider", "value"),
+    State("resolution-filter", "value"),
+    State("duration-filter", "value"),
     prevent_initial_call=True,
 )
-def export_csv(_, sentiments, start_date, end_date, resolved, duration_range):
-    data = filter_data(sentiments, start_date, end_date, resolved, duration_range)
+def export_csv(n_clicks, start_date, end_date, sentiment, resolution, duration_range):
+    if not n_clicks:
+        return no_update
+
+    df = filtered_data(start_date, end_date, sentiment, resolution, duration_range)
+
+    columns = [
+        "CallID", "Date", "Satisfaction rating", "Sentiment",
+        "Resolved", "ResolvedStatus", "AvgTalkDuration",
+        "DurationSeconds", "DurationMinutes",
+    ]
+    columns = [column for column in columns if column in df.columns]
 
     return dcc.send_data_frame(
-        data.to_csv,
-        "filtered_call_center_data.csv",
+        df[columns].to_csv,
+        filename=f"call_center_report_{datetime.now():%Y%m%d_%H%M%S}.csv",
         index=False,
-        encoding="utf-8-sig",
     )
 
 
 # ============================================================
-# SAVED FILTER VIEWS
+# SAVED VIEW TABLE
 # ============================================================
 
-def fetch_saved_views():
-    with closing(connect_db()) as connection:
-        return connection.execute("""
-            SELECT id, name, sentiment, start_date, end_date, resolved,
-                   duration_min, duration_max, created_at
-            FROM past_filters
-            ORDER BY id DESC
-            LIMIT 100
-        """).fetchall()
-
-
-def render_saved_views(rows):
-    if not rows:
-        return html.P(
-            "No saved views yet. Save a filter setup to see it here.",
-            className="text-secondary small mt-2",
+def saved_views_table(views):
+    if not views:
+        return html.Div(
+            "No saved views yet. Apply filters and save your first view.",
+            className="saved-feedback",
         )
 
-    cards = []
+    return dbc.Table(
+        [
+            html.Thead(
+                html.Tr(
+                    [
+                        html.Th("View name"),
+                        html.Th("Created"),
+                    ]
+                )
+            ),
+            html.Tbody(
+                [
+                    html.Tr(
+                        [
+                            html.Td(view["name"], style={"fontWeight": "650"}),
+                            html.Td(view["created_at"]),
+                        ]
+                    )
+                    for view in views
+                ]
+            ),
+        ],
+        hover=True,
+        responsive=True,
+        class_name="align-middle",
+    )
 
-    for row in rows:
-        row = dict(row)
 
-        sentiments = row["sentiment"] or "All"
-        resolution = {
-            "Y": "Resolved",
-            "N": "Unresolved",
-            "": "All",
-        }.get(row["resolved"], "All")
-
-        low = row["duration_min"]
-        high = row["duration_max"]
-        duration_text = (
-            f"{low:g}–{high:g} sec"
-            if low is not None and high is not None
-            else "All durations"
-        )
-
-        description = (
-            f"Sentiment: {sentiments} · "
-            f"Dates: {row['start_date'] or 'Any'} to {row['end_date'] or 'Any'} · "
-            f"Resolution: {resolution} · Duration: {duration_text}"
-        )
-
-        cards.append(
-            dbc.Card(
-                dbc.CardBody([
-                    dbc.Row([
-                        dbc.Col([
-                            html.Div(
-                                row["name"] or f"Saved view #{row['id']}",
-                                className="fw-bold",
-                            ),
-                            html.Div(description, className="small text-secondary mt-1"),
-                            html.Div(
-                                f"Saved: {row['created_at']}",
-                                className="small text-secondary mt-1",
-                            ),
-                        ], xs=12, md=8),
-                        dbc.Col([
-                            dbc.ButtonGroup([
-                                dbc.Button(
-                                    "Apply",
-                                    id={"type": "apply-view", "index": row["id"]},
-                                    color="primary",
-                                    size="sm",
-                                    n_clicks=0,
-                                ),
-                                dbc.Button(
-                                    "Delete",
-                                    id={"type": "delete-view", "index": row["id"]},
-                                    color="danger",
-                                    outline=True,
-                                    size="sm",
-                                    n_clicks=0,
-                                ),
-                            ], className="mt-2 mt-md-0"),
-                        ], xs=12, md=4, className="d-flex justify-content-md-end align-items-center"),
-                    ], className="align-items-center"),
-                ]),
-                className="mb-2",
-            )
-        )
-
-    return html.Div(cards)
-
+# ============================================================
+# MANAGE SAVED VIEWS
+# ============================================================
 
 @app.callback(
     Output("saved-feedback", "children"),
-    Output("past-data-output", "children"),
-    Output("sentiment-filter", "value", allow_duplicate=True),
-    Output("date-picker", "start_date", allow_duplicate=True),
-    Output("date-picker", "end_date", allow_duplicate=True),
-    Output("resolved-filter", "value", allow_duplicate=True),
-    Output("duration-slider", "value", allow_duplicate=True),
+    Output("saved-views-table", "children"),
+    Output("saved-view-select", "options"),
+    Output("saved-views-store", "data"),
     Input("save-view-btn", "n_clicks"),
-    Input("view-past-btn", "n_clicks"),
-    Input("delete-all-btn", "n_clicks"),
-    Input({"type": "apply-view", "index": ALL}, "n_clicks"),
-    Input({"type": "delete-view", "index": ALL}, "n_clicks"),
-    State("view-name", "value"),
+    Input("refresh-views-btn", "n_clicks"),
+    Input("delete-all-views-btn", "n_clicks"),
+    State("saved-view-name", "value"),
+    State("date-filter", "start_date"),
+    State("date-filter", "end_date"),
     State("sentiment-filter", "value"),
-    State("date-picker", "start_date"),
-    State("date-picker", "end_date"),
-    State("resolved-filter", "value"),
-    State("duration-slider", "value"),
+    State("resolution-filter", "value"),
+    State("duration-filter", "value"),
     prevent_initial_call=True,
 )
 def manage_saved_views(
-    _save_clicks,
-    _refresh_clicks,
-    _delete_all_clicks,
-    _apply_clicks,
-    _delete_clicks,
-    view_name,
-    sentiments,
+    save_clicks,
+    refresh_clicks,
+    delete_clicks,
+    name,
     start_date,
     end_date,
-    resolved,
-    duration,
+    sentiment,
+    resolution,
+    duration_range,
 ):
-    action = ctx.triggered_id
-    feedback = no_update
-    apply_values = [no_update] * 5
+    triggered = ctx.triggered_id
+    message = ""
 
-    try:
-        with closing(connect_db()) as connection:
-            if action == "save-view-btn":
-                name = (view_name or "").strip() or (
-                    "Saved view " + datetime.now().strftime("%Y-%m-%d %H:%M")
-                )
+    if triggered == "save-view-btn":
+        name = (name or "").strip()
 
-                connection.execute(
+        if not name:
+            views = get_saved_views()
+            return (
+                "Enter a view name before saving.",
+                saved_views_table(views),
+                make_saved_view_options(views),
+                views,
+            )
+
+        filters = {
+            "start_date": str(start_date) if start_date else None,
+            "end_date": str(end_date) if end_date else None,
+            "sentiment": sentiment or "All",
+            "resolution": resolution or "All",
+            "duration_range": duration_range or DEFAULT_DURATION,
+        }
+
+        with _DB_LOCK:
+            with db_connection() as con:
+                con.execute(
                     """
-                    INSERT INTO past_filters
-                    (name, sentiment, start_date, end_date, resolved,
-                     duration_min, duration_max)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO saved_views (name, filters_json, created_at)
+                    VALUES (?, ?, ?)
                     """,
                     (
                         name,
-                        ",".join(sentiments or []),
-                        str(start_date or ""),
-                        str(end_date or ""),
-                        resolved or "",
-                        float(duration[0]) if duration else None,
-                        float(duration[1]) if duration else None,
+                        json.dumps(filters),
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),
                     ),
                 )
-                connection.commit()
-                feedback = dbc.Alert(
-                    "Current filter view saved successfully.",
-                    color="success",
-                    dismissable=True,
-                )
+                con.commit()
 
-            elif action == "delete-all-btn":
-                connection.execute("DELETE FROM past_filters")
-                connection.commit()
-                feedback = dbc.Alert(
-                    "All saved views have been deleted.",
-                    color="info",
-                    dismissable=True,
-                )
+        message = f"Saved view: {name}"
 
-            elif isinstance(action, dict) and action.get("type") == "delete-view":
-                connection.execute(
-                    "DELETE FROM past_filters WHERE id = ?",
-                    (int(action["index"]),),
-                )
-                connection.commit()
-                feedback = dbc.Alert(
-                    "Saved view deleted.",
-                    color="info",
-                    dismissable=True,
-                )
+    elif triggered == "delete-all-views-btn":
+        with _DB_LOCK:
+            with db_connection() as con:
+                con.execute("DELETE FROM saved_views")
+                con.commit()
+        message = "All saved views deleted."
 
-            elif isinstance(action, dict) and action.get("type") == "apply-view":
-                row = connection.execute(
-                    "SELECT * FROM past_filters WHERE id = ?",
-                    (int(action["index"]),),
-                ).fetchone()
+    elif triggered == "refresh-views-btn":
+        message = "Saved views refreshed."
 
-                if row:
-                    saved_sentiments = [
-                        item for item in (row["sentiment"] or "").split(",") if item
-                    ]
-
-                    saved_start = row["start_date"] or None
-                    saved_end = row["end_date"] or None
-                    saved_resolved = row["resolved"] or None
-
-                    low = row["duration_min"]
-                    high = row["duration_max"]
-
-                    if low is None:
-                        low = MIN_DURATION
-                    if high is None:
-                        high = MAX_DURATION
-
-                    low = max(SLIDER_MIN, min(float(low), SLIDER_MAX))
-                    high = max(SLIDER_MIN, min(float(high), SLIDER_MAX))
-
-                    if low > high:
-                        low, high = high, low
-
-                    apply_values = [
-                        saved_sentiments,
-                        saved_start,
-                        saved_end,
-                        saved_resolved,
-                        [low, high],
-                    ]
-
-                    feedback = dbc.Alert(
-                        "Saved filter view applied.",
-                        color="success",
-                        dismissable=True,
-                    )
-
-            rows = connection.execute("""
-                SELECT id, name, sentiment, start_date, end_date, resolved,
-                       duration_min, duration_max, created_at
-                FROM past_filters
-                ORDER BY id DESC
-                LIMIT 100
-            """).fetchall()
-
-        return feedback, render_saved_views(rows), *apply_values
-
-    except sqlite3.Error as exc:
-        return (
-            dbc.Alert(
-                f"Database error: {exc}",
-                color="danger",
-                dismissable=True,
-            ),
-            no_update,
-            *([no_update] * 5),
-        )
+    views = get_saved_views()
+    return (
+        message,
+        saved_views_table(views),
+        make_saved_view_options(views),
+        views,
+    )
 
 
 # ============================================================
-# INITIAL SAVED VIEWS
+# LOAD SAVED VIEW
 # ============================================================
 
-app.layout.children[0].children[1].children.append(
-    html.Div(id="initial-load-placeholder", style={"display": "none"})
-)
-
-# The saved views are populated on page load and after every saved-view action.
 @app.callback(
-    Output("past-data-output", "children", allow_duplicate=True),
-    Input("view-past-btn", "n_clicks"),
+    Output("date-filter", "start_date", allow_duplicate=True),
+    Output("date-filter", "end_date", allow_duplicate=True),
+    Output("sentiment-filter", "value", allow_duplicate=True),
+    Output("resolution-filter", "value", allow_duplicate=True),
+    Output("duration-filter", "value", allow_duplicate=True),
+    Output("saved-feedback", "children", allow_duplicate=True),
+    Input("load-view-btn", "n_clicks"),
+    State("saved-view-select", "value"),
+    prevent_initial_call=True,
+)
+def load_saved_view(n_clicks, selected_id):
+    if not n_clicks:
+        return (no_update,) * 6
+
+    if selected_id is None:
+        return no_update, no_update, no_update, no_update, no_update, "Choose a saved view first."
+
+    with _DB_LOCK:
+        with db_connection() as con:
+            row = con.execute(
+                "SELECT name, filters_json FROM saved_views WHERE id = ?",
+                (selected_id,),
+            ).fetchone()
+
+    if row is None:
+        return no_update, no_update, no_update, no_update, no_update, "Saved view not found. Refresh the list."
+
+    try:
+        filters = json.loads(row["filters_json"])
+    except (ValueError, TypeError):
+        return no_update, no_update, no_update, no_update, no_update, "Could not read the saved filters."
+
+    start = filters.get("start_date") or MIN_DATE
+    end = filters.get("end_date") or MAX_DATE
+    duration = filters.get("duration_range") or DEFAULT_DURATION
+
+    try:
+        duration = [
+            max(SLIDER_MIN, min(SLIDER_MAX, float(duration[0]))),
+            max(SLIDER_MIN, min(SLIDER_MAX, float(duration[1]))),
+        ]
+        duration.sort()
+    except (TypeError, ValueError, IndexError):
+        duration = DEFAULT_DURATION
+
+    return (
+        start,
+        end,
+        filters.get("sentiment", "All"),
+        filters.get("resolution", "All"),
+        duration,
+        f"Loaded view: {row['name']}",
+    )
+
+
+# ============================================================
+# INITIAL SAVED VIEWS DISPLAY
+# ============================================================
+
+@app.callback(
+    Output("saved-views-table", "children", allow_duplicate=True),
+    Input("saved-views-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def refresh_saved_views(_):
-    return render_saved_views(fetch_saved_views())
+def render_initial_saved_views(views):
+    return saved_views_table(views or [])
 
 
 # ============================================================
-# RUN SERVER
+# RUN: JUPYTER OR APP.PY
 # ============================================================
 
 if __name__ == "__main__":
-    app.run(
-        host="127.0.0.1",
-        port=PORT,
-        debug=False,
-    )
+    try:
+        from IPython import get_ipython
+        shell = get_ipython()
+        in_jupyter = shell is not None and "IPKernelApp" in shell.config
+    except Exception:
+        in_jupyter = False
+
+    if in_jupyter:
+        app.run(
+            host="127.0.0.1",
+            port=PORT,
+            debug=False,
+            jupyter_mode="external",
+        )
+    else:
+        app.run(
+            host="0.0.0.0",
+            port=PORT,
+            debug=DEBUG,
+        )
