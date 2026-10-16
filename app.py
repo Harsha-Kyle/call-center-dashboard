@@ -1,6 +1,4 @@
 # Call Center Sentiment Analytics — Enhanced Dashboard
-
-```python
 import os
 import sqlite3
 from contextlib import closing
@@ -1761,5 +1759,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8050")),
         debug=False,
     )
-```
-
